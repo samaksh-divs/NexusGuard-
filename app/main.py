@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="Real-time cryptocurrency transaction fraud detection platform.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -58,7 +58,7 @@ def read_root():
     return {
         "project": settings.app_name,
         "status": "running",
-        "phase": "4 - dead letter queue & failure handling",
+        "phase": "5 - fraud detection & risk analysis engine",
     }
 
 
@@ -142,3 +142,34 @@ def read_transaction(transaction_id: str):
     if doc is None:
         raise HTTPException(status_code=404, detail=f"Transaction '{transaction_id}' not found.")
     return serialize_transaction(doc)
+
+
+@app.get("/transactions/{transaction_id}/risk")
+def read_transaction_risk(transaction_id: str):
+    """
+    Return the fraud/risk analysis for a transaction.
+
+    404 if the transaction doesn't exist at all, OR if it exists but
+    was inserted via POST /transactions/test (which skips fraud
+    analysis) — in either case there's no risk result to return.
+    Only transactions processed through the asynchronous
+    RabbitMQ -> worker pipeline (POST /transactions/publish) carry a
+    risk_score.
+    """
+    doc = get_transaction(transaction_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"Transaction '{transaction_id}' not found.")
+
+    if "risk_score" not in doc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No risk analysis available for transaction '{transaction_id}'.",
+        )
+
+    return {
+        "transaction_id": doc["transaction_id"],
+        "risk_score": doc["risk_score"],
+        "risk_level": doc["risk_level"],
+        "decision": doc["decision"],
+        "reasons": doc["fraud_reasons"],
+    }

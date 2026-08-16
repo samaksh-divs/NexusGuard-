@@ -15,6 +15,7 @@ directly. Keeping queries here means:
 """
 
 import logging
+from datetime import datetime, timezone
 
 from pymongo.errors import DuplicateKeyError
 
@@ -28,13 +29,21 @@ class DuplicateTransactionError(Exception):
     """Raised when a transaction_id already exists in the collection."""
 
 
-def insert_transaction(transaction: TransactionCreate) -> dict:
+def insert_transaction(transaction: TransactionCreate, fraud_result: dict | None = None) -> dict:
     """
     Insert a new transaction document.
 
     Computes `transaction_value` (price * quantity) server-side rather
     than trusting a client-supplied value, since that's a derived
     field, not raw input.
+
+    `fraud_result`, if provided (Phase 5), is a dict as produced by
+    FraudResult.to_dict() — risk_score / risk_level / decision /
+    fraud_reasons — and is merged directly into the same document
+    rather than a separate collection, per the project's requirement
+    to extend the existing transaction record. Callers that don't run
+    fraud analysis (e.g. POST /transactions/test) simply omit it, and
+    the document is stored exactly as it was in Phase 2.
 
     Raises DuplicateTransactionError if transaction_id already exists
     (enforced by the unique index created in mongodb.py).
@@ -50,6 +59,10 @@ def insert_transaction(transaction: TransactionCreate) -> dict:
         "transaction_value": round(transaction.price * transaction.quantity, 8),
         "status": transaction.status,
     }
+
+    if fraud_result is not None:
+        document.update(fraud_result)
+        document["processed_at"] = datetime.now(timezone.utc)
 
     try:
         result = db["transactions"].insert_one(document)
@@ -90,8 +103,14 @@ def serialize_transaction(doc: dict) -> dict:
     MongoDB's `_id` is a BSON ObjectId, which FastAPI/Pydantic can't
     serialize to JSON directly. We convert it to a plain string field
     called `id` and drop the raw `_id` key.
+
+    Fraud fields (risk_score, risk_level, decision, fraud_reasons,
+    processed_at) are included only when present on the document —
+    transactions inserted via POST /transactions/test (no fraud
+    analysis run) simply won't have them, and this stays backward
+    compatible with Phase 1-4 response shapes.
     """
-    return {
+    out = {
         "id": str(doc["_id"]),
         "transaction_id": doc["transaction_id"],
         "timestamp": doc["timestamp"],
@@ -101,3 +120,9 @@ def serialize_transaction(doc: dict) -> dict:
         "transaction_value": doc["transaction_value"],
         "status": doc["status"],
     }
+
+    for field in ("risk_score", "risk_level", "decision", "fraud_reasons", "processed_at"):
+        if field in doc:
+            out[field] = doc[field]
+
+    return out

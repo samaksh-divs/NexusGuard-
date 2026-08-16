@@ -25,6 +25,13 @@ Two distinct failure paths both dead-letter the same way:
   2. A deliberate TEST-ONLY failure trigger (see
      _is_test_failure_trigger) that lets us verify the DLQ path
      without corrupting real validation/storage logic.
+
+Phase 5 change: between validation and storage, the worker now runs
+the transaction through the Fraud Detection Engine
+(app/fraud/engine.py) and stores the resulting risk_score/risk_level/
+decision/fraud_reasons alongside the transaction document. An
+unexpected error during fraud analysis is treated the same as a
+storage failure — nack to the DLQ, never a silent ack.
 """
 
 import json
@@ -35,7 +42,8 @@ from pika.spec import Basic, BasicProperties
 from pydantic import ValidationError
 
 from app.config.settings import settings
-from app.database.repositories import DuplicateTransactionError, insert_transaction
+from app.database.repositories import DuplicateTransactionError, get_transaction, insert_transaction
+from app.fraud.engine import calculate_risk_score
 from app.validation.schemas import TransactionCreate
 
 logger = logging.getLogger(__name__)
@@ -82,10 +90,33 @@ def handle_message(channel: BlockingChannel, method: Basic.Deliver, properties: 
         logger.warning("[WORKER] Message routed to DLQ: %s", transaction_id)
         return
 
-    # --- Store in MongoDB ---
+    # --- Store in MongoDB (with fraud analysis) ---
     logger.info("[WORKER] Processing transaction: %s", transaction_id)
     try:
-        insert_transaction(transaction)
+        # Read-only duplicate check for RULE 4 (explainability only —
+        # the real uniqueness guarantee is still the unique index /
+        # DuplicateTransactionError below, unchanged from Phase 2-4).
+        is_duplicate = get_transaction(transaction_id) is not None
+
+        fraud_result = calculate_risk_score(
+            transaction_value=round(transaction.price * transaction.quantity, 8),
+            quantity=transaction.quantity,
+            symbol=transaction.symbol,
+            is_duplicate=is_duplicate,
+            high_value_threshold=settings.fraud_high_value_threshold,
+            very_high_value_threshold=settings.fraud_very_high_value_threshold,
+            high_quantity_threshold=settings.fraud_high_quantity_threshold,
+            suspicious_symbols=settings.suspicious_symbols_set,
+        )
+        logger.info(
+            "[WORKER] Fraud analysis complete: %s (score=%s, level=%s, decision=%s)",
+            transaction_id,
+            fraud_result.risk_score,
+            fraud_result.risk_level.value,
+            fraud_result.decision.value,
+        )
+
+        insert_transaction(transaction, fraud_result=fraud_result.to_dict())
         logger.info("[WORKER] Transaction stored successfully: %s", transaction_id)
 
     except DuplicateTransactionError:

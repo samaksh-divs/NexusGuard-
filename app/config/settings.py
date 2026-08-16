@@ -43,11 +43,39 @@ class Settings(BaseSettings):
     # once. Kept configurable rather than hard-coded in consumer.py.
     rabbitmq_prefetch_count: int = 1
 
+    # --- Fraud Detection Engine (Phase 5) ---
+    # Thresholds are configurable so tuning doesn't require code
+    # changes. Defaults are sensible for local development/testing
+    # with typical crypto price/quantity ranges.
+    fraud_high_value_threshold: float = 50000.0
+    fraud_very_high_value_threshold: float = 150000.0
+    fraud_high_quantity_threshold: float = 5.0
+
+    # Comma-separated list of symbols treated as suspicious, e.g.
+    # "SCAMCOIN,RUGPULL". Empty by default — no symbol is inherently
+    # flagged; this just demonstrates the mechanism. Parsed via
+    # suspicious_symbols_set below.
+    fraud_suspicious_symbols: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",  # ignore vars in .env not yet used (e.g. future Mongo/RabbitMQ keys)
     )
+
+    @property
+    def suspicious_symbols_set(self) -> set[str]:
+        """
+        Parse FRAUD_SUSPICIOUS_SYMBOLS ("BTC,ETH" style) into an
+        uppercase set for case-insensitive lookups. A computed
+        property (not a stored field) so the raw env var stays a
+        plain string in .env, easy to edit by hand.
+        """
+        return {
+            symbol.strip().upper()
+            for symbol in self.fraud_suspicious_symbols.split(",")
+            if symbol.strip()
+        }
 
 
 # Single shared settings instance, imported everywhere else.
