@@ -116,6 +116,12 @@ def _ensure_indexes(database: Database) -> None:
     database["transactions"].create_index([("transaction_id", ASCENDING)], unique=True)
     database["transactions"].create_index([("timestamp", ASCENDING)])
 
+    # Phase 6: behavioral analysis repeatedly queries "recent
+    # transactions for this account, most recent first" — this
+    # compound index makes that an index-only scan instead of a
+    # collection scan as transaction volume grows.
+    database["transactions"].create_index([("account_id", ASCENDING), ("timestamp", ASCENDING)])
+
     # predictions / explanations / failed_transactions will be written
     # to by later phases (ML, SHAP, DLQ handling). We index
     # transaction_id now since every document in those collections

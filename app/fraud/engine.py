@@ -66,12 +66,46 @@ class FraudResult:
         }
 
 
-def _risk_level_for_score(score: int) -> RiskLevel:
+def risk_level_for_score(score: int) -> RiskLevel:
+    """
+    Map a 0-100 score to a RiskLevel. Public (not the Phase 5-only
+    private helper it used to be) because Phase 6's combined-score
+    logic and the /behavior endpoint both need the same LOW/MEDIUM/
+    HIGH banding applied to scores that didn't come from
+    calculate_risk_score() directly.
+    """
     if score <= _LOW_MAX:
         return RiskLevel.LOW
     if score <= _MEDIUM_MAX:
         return RiskLevel.MEDIUM
     return RiskLevel.HIGH
+
+
+def decision_for_level(level: RiskLevel) -> Decision:
+    return _LEVEL_TO_DECISION[level]
+
+
+def combine_scores(
+    individual_score: int,
+    behavioral_score: int,
+    individual_weight: float,
+    behavioral_weight: float,
+) -> tuple[int, RiskLevel, Decision]:
+    """
+    Blend Phase 5's per-transaction score with Phase 6's behavioral
+    score into one combined score, using configurable weights (see
+    settings.fraud_individual_weight / fraud_behavioral_weight).
+
+    Returns (combined_score, risk_level, decision) using the same
+    0-100 banding and LEVEL->DECISION mapping as calculate_risk_score,
+    so a combined score of e.g. 75 means exactly the same thing
+    (HIGH/BLOCKED) as an individual score of 75 would have in Phase 5.
+    """
+    combined = round(individual_score * individual_weight + behavioral_score * behavioral_weight)
+    combined = max(0, min(100, combined))
+    level = risk_level_for_score(combined)
+    decision = decision_for_level(level)
+    return combined, level, decision
 
 
 def calculate_risk_score(
@@ -111,7 +145,7 @@ def calculate_risk_score(
     # Clamp to the documented 0-100 range even if future rules push
     # the raw sum higher.
     risk_score = max(0, min(100, total_points))
-    risk_level = _risk_level_for_score(risk_score)
+    risk_level = risk_level_for_score(risk_score)
     decision = _LEVEL_TO_DECISION[risk_level]
 
     return FraudResult(risk_score=risk_score, risk_level=risk_level, decision=decision, reasons=reasons)

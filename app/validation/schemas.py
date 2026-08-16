@@ -28,6 +28,13 @@ class TransactionCreate(BaseModel):
     price: float = Field(..., gt=0)
     quantity: float = Field(..., gt=0)
     status: str = Field(default="received")
+    # Phase 6: identifies which account/user this transaction belongs
+    # to, so behavioral analysis can look up that account's history.
+    # Defaulted (not required) so any client/test that predates Phase
+    # 6 and doesn't send it still validates — it just won't get
+    # meaningful behavioral analysis (an "UNKNOWN" account has no
+    # real history to compare against).
+    account_id: str = Field(default="UNKNOWN", min_length=1, description="Account/user identifier")
 
 
 class TransactionOut(BaseModel):
@@ -39,3 +46,4 @@ class TransactionOut(BaseModel):
     quantity: float
     transaction_value: float
     status: str
+    account_id: str

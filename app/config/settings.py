@@ -57,6 +57,41 @@ class Settings(BaseSettings):
     # suspicious_symbols_set below.
     fraud_suspicious_symbols: str = ""
 
+    # --- Behavioral & Historical Fraud Detection (Phase 6) ---
+    # How many historical transactions to load per account when
+    # computing behavioral signals. Bounds memory/query cost — we
+    # never load "all history", only the most recent N.
+    behavior_history_lookback: int = 100
+
+    # Velocity: how many prior transactions within this many seconds
+    # counts as an anomaly.
+    behavior_velocity_window_seconds: int = 60
+    behavior_velocity_max_transactions: int = 5
+
+    # Frequency: compares the transaction rate in a short recent
+    # window against a longer baseline window.
+    behavior_frequency_window_minutes: int = 60
+    behavior_frequency_baseline_window_minutes: int = 1440  # 24 hours
+    behavior_frequency_multiplier: float = 3.0
+
+    # Value deviation / unusual value: current value vs. the
+    # account's historical average transaction_value.
+    behavior_value_deviation_multiplier: float = 3.0
+    behavior_value_unusual_multiplier: float = 8.0
+
+    # Symbol anomaly: only evaluated once an account has at least
+    # this many historical transactions (too little history makes
+    # "unusual symbol" meaningless).
+    behavior_min_history_for_symbol_check: int = 3
+
+    # --- Combined Risk Weighting (Phase 6) ---
+    # How Phase 5's per-transaction score and Phase 6's behavioral
+    # score are blended into one combined_score. Must sum to 1.0 for
+    # the combined score to stay within 0-100, though the engine
+    # clamps regardless.
+    fraud_individual_weight: float = 0.6
+    fraud_behavioral_weight: float = 0.4
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

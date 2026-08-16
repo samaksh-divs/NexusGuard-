@@ -32,6 +32,15 @@ the transaction through the Fraud Detection Engine
 decision/fraud_reasons alongside the transaction document. An
 unexpected error during fraud analysis is treated the same as a
 storage failure — nack to the DLQ, never a silent ack.
+
+Phase 6 change: after the Phase 5 individual-transaction score is
+computed, the worker also loads the account's recent history
+(get_account_history) and runs the Behavioral Engine
+(app/fraud/behavior.py), then blends both scores into one
+combined_score (app.fraud.engine.combine_scores). All of this happens
+inside the same try block as before, so any failure in history
+lookup, behavioral analysis, or blending still nacks to the DLQ
+exactly like a Phase 5 fraud-analysis or storage failure would.
 """
 
 import json
@@ -42,8 +51,14 @@ from pika.spec import Basic, BasicProperties
 from pydantic import ValidationError
 
 from app.config.settings import settings
-from app.database.repositories import DuplicateTransactionError, get_transaction, insert_transaction
-from app.fraud.engine import calculate_risk_score
+from app.database.repositories import (
+    DuplicateTransactionError,
+    get_account_history,
+    get_transaction,
+    insert_transaction,
+)
+from app.fraud.behavior import analyze_behavior
+from app.fraud.engine import calculate_risk_score, combine_scores
 from app.validation.schemas import TransactionCreate
 
 logger = logging.getLogger(__name__)
@@ -90,16 +105,19 @@ def handle_message(channel: BlockingChannel, method: Basic.Deliver, properties: 
         logger.warning("[WORKER] Message routed to DLQ: %s", transaction_id)
         return
 
-    # --- Store in MongoDB (with fraud analysis) ---
+    # --- Store in MongoDB (with fraud + behavioral analysis) ---
     logger.info("[WORKER] Processing transaction: %s", transaction_id)
     try:
+        transaction_value = round(transaction.price * transaction.quantity, 8)
+
         # Read-only duplicate check for RULE 4 (explainability only —
         # the real uniqueness guarantee is still the unique index /
         # DuplicateTransactionError below, unchanged from Phase 2-4).
         is_duplicate = get_transaction(transaction_id) is not None
 
-        fraud_result = calculate_risk_score(
-            transaction_value=round(transaction.price * transaction.quantity, 8),
+        # Phase 5: individual transaction risk.
+        individual_result = calculate_risk_score(
+            transaction_value=transaction_value,
             quantity=transaction.quantity,
             symbol=transaction.symbol,
             is_duplicate=is_duplicate,
@@ -109,14 +127,71 @@ def handle_message(channel: BlockingChannel, method: Basic.Deliver, properties: 
             suspicious_symbols=settings.suspicious_symbols_set,
         )
         logger.info(
-            "[WORKER] Fraud analysis complete: %s (score=%s, level=%s, decision=%s)",
+            "[WORKER] Individual fraud analysis complete: %s (score=%s)",
             transaction_id,
-            fraud_result.risk_score,
-            fraud_result.risk_level.value,
-            fraud_result.decision.value,
+            individual_result.risk_score,
         )
 
-        insert_transaction(transaction, fraud_result=fraud_result.to_dict())
+        # Phase 6: behavioral analysis against the account's history.
+        history = get_account_history(
+            transaction.account_id,
+            exclude_transaction_id=transaction_id,
+            limit=settings.behavior_history_lookback,
+        )
+        behavioral_result = analyze_behavior(
+            current_timestamp=transaction.timestamp,
+            current_value=transaction_value,
+            current_symbol=transaction.symbol,
+            history=history,
+            velocity_window_seconds=settings.behavior_velocity_window_seconds,
+            velocity_max_transactions=settings.behavior_velocity_max_transactions,
+            frequency_window_minutes=settings.behavior_frequency_window_minutes,
+            frequency_baseline_window_minutes=settings.behavior_frequency_baseline_window_minutes,
+            frequency_multiplier=settings.behavior_frequency_multiplier,
+            value_deviation_multiplier=settings.behavior_value_deviation_multiplier,
+            value_unusual_multiplier=settings.behavior_value_unusual_multiplier,
+            min_history_for_symbol_check=settings.behavior_min_history_for_symbol_check,
+        )
+        logger.info(
+            "[WORKER] Behavioral analysis complete: %s (score=%s, history_size=%s)",
+            transaction_id,
+            behavioral_result.score,
+            len(history),
+        )
+
+        combined_score, combined_level, combined_decision = combine_scores(
+            individual_result.risk_score,
+            behavioral_result.score,
+            settings.fraud_individual_weight,
+            settings.fraud_behavioral_weight,
+        )
+        logger.info(
+            "[WORKER] Combined risk: %s (individual=%s, behavioral=%s, combined=%s, decision=%s)",
+            transaction_id,
+            individual_result.risk_score,
+            behavioral_result.score,
+            combined_score,
+            combined_decision.value,
+        )
+
+        # risk_score/risk_level/decision/fraud_reasons keep their
+        # Phase 5 names and now carry the COMBINED result, so existing
+        # consumers of those fields (e.g. the original
+        # GET /transactions/{id}/risk contract) keep working without
+        # changes. individual_score/behavioral_score/combined_score/
+        # behavioral_signals are additive, Phase 6-only fields.
+        fraud_storage = {
+            "risk_score": combined_score,
+            "risk_level": combined_level.value,
+            "decision": combined_decision.value,
+            "fraud_reasons": individual_result.reasons,
+            "individual_score": individual_result.risk_score,
+            "behavioral_score": behavioral_result.score,
+            "combined_score": combined_score,
+            "behavioral_signals": [s.to_dict() for s in behavioral_result.signals],
+        }
+
+        insert_transaction(transaction, fraud_result=fraud_storage)
         logger.info("[WORKER] Transaction stored successfully: %s", transaction_id)
 
     except DuplicateTransactionError:

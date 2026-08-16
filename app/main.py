@@ -23,6 +23,7 @@ from app.database.repositories import (
     insert_transaction,
     serialize_transaction,
 )
+from app.fraud.engine import risk_level_for_score
 from app.messaging.publisher import close_publisher, connect_publisher, publish_transaction
 from app.validation.schemas import TransactionCreate
 
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="Real-time cryptocurrency transaction fraud detection platform.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -58,7 +59,7 @@ def read_root():
     return {
         "project": settings.app_name,
         "status": "running",
-        "phase": "5 - fraud detection & risk analysis engine",
+        "phase": "6 - behavioral & historical fraud detection",
     }
 
 
@@ -155,6 +156,15 @@ def read_transaction_risk(transaction_id: str):
     Only transactions processed through the asynchronous
     RabbitMQ -> worker pipeline (POST /transactions/publish) carry a
     risk_score.
+
+    Phase 6: risk_score/risk_level/decision now reflect the COMBINED
+    score (individual + behavioral), same field names as Phase 5 so
+    existing callers of this endpoint keep working. individual_score/
+    behavioral_score/combined_score are additive fields. For
+    transactions processed before Phase 6 existed (which only have
+    the flat Phase 5 fields), individual_score/combined_score fall
+    back to the original risk_score and behavioral_score defaults to 0
+    — there's no behavioral data to report for those older records.
     """
     doc = get_transaction(transaction_id)
     if doc is None:
@@ -166,10 +176,46 @@ def read_transaction_risk(transaction_id: str):
             detail=f"No risk analysis available for transaction '{transaction_id}'.",
         )
 
+    behavioral_signals = doc.get("behavioral_signals", [])
+    reasons = list(doc.get("fraud_reasons", [])) + [s["message"] for s in behavioral_signals]
+
     return {
         "transaction_id": doc["transaction_id"],
+        "individual_score": doc.get("individual_score", doc["risk_score"]),
+        "behavioral_score": doc.get("behavioral_score", 0),
+        "combined_score": doc.get("combined_score", doc["risk_score"]),
         "risk_score": doc["risk_score"],
         "risk_level": doc["risk_level"],
         "decision": doc["decision"],
-        "reasons": doc["fraud_reasons"],
+        "reasons": reasons,
+    }
+
+
+@app.get("/transactions/{transaction_id}/behavior")
+def read_transaction_behavior(transaction_id: str):
+    """
+    Return only the behavioral analysis for a transaction — how it
+    compares to the account's own historical activity, independent of
+    the Phase 5 individual-transaction score.
+
+    404 if the transaction doesn't exist, or if it wasn't processed
+    through the async pipeline (no behavioral_score stored).
+    """
+    doc = get_transaction(transaction_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"Transaction '{transaction_id}' not found.")
+
+    if "behavioral_score" not in doc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No behavioral analysis available for transaction '{transaction_id}'.",
+        )
+
+    behavioral_score = doc["behavioral_score"]
+    return {
+        "transaction_id": doc["transaction_id"],
+        "account_id": doc.get("account_id", "UNKNOWN"),
+        "behavioral_score": behavioral_score,
+        "risk_level": risk_level_for_score(behavioral_score).value,
+        "signals": doc.get("behavioral_signals", []),
     }

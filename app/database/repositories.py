@@ -58,6 +58,7 @@ def insert_transaction(transaction: TransactionCreate, fraud_result: dict | None
         "quantity": transaction.quantity,
         "transaction_value": round(transaction.price * transaction.quantity, 8),
         "status": transaction.status,
+        "account_id": transaction.account_id,
     }
 
     if fraud_result is not None:
@@ -73,6 +74,36 @@ def insert_transaction(transaction: TransactionCreate, fraud_result: dict | None
     document["_id"] = result.inserted_id
     logger.info("Transaction inserted: %s", transaction.transaction_id)
     return document
+
+
+def get_account_history(account_id: str, exclude_transaction_id: str | None = None, limit: int = 100) -> list[dict]:
+    """
+    Return an account's most recent transactions, most recent first,
+    for use by the behavioral fraud engine (app/fraud/behavior.py).
+
+    `limit` bounds how much history is ever loaded into memory — we
+    deliberately never load "all history" for an account, only the
+    most recent `limit` transactions (see BEHAVIOR_HISTORY_LOOKBACK).
+    `exclude_transaction_id` lets the worker exclude the
+    transaction currently being processed if it was already inserted
+    (not the normal Phase 6 order, but keeps this function safe to
+    reuse regardless of call order).
+
+    Only the fields behavioral analysis actually needs are projected
+    back, keeping the query and the in-memory payload small.
+    """
+    db = get_database()
+    query: dict = {"account_id": account_id}
+    if exclude_transaction_id is not None:
+        query["transaction_id"] = {"$ne": exclude_transaction_id}
+
+    cursor = (
+        db["transactions"]
+        .find(query, {"_id": 0, "timestamp": 1, "transaction_value": 1, "symbol": 1})
+        .sort("timestamp", -1)
+        .limit(limit)
+    )
+    return list(cursor)
 
 
 def get_transaction(transaction_id: str) -> dict | None:
@@ -105,10 +136,11 @@ def serialize_transaction(doc: dict) -> dict:
     called `id` and drop the raw `_id` key.
 
     Fraud fields (risk_score, risk_level, decision, fraud_reasons,
-    processed_at) are included only when present on the document —
-    transactions inserted via POST /transactions/test (no fraud
-    analysis run) simply won't have them, and this stays backward
-    compatible with Phase 1-4 response shapes.
+    processed_at, individual_score, behavioral_score, combined_score,
+    behavioral_signals) are included only when present on the
+    document — transactions inserted via POST /transactions/test (no
+    fraud analysis run) simply won't have them, and this stays
+    backward compatible with Phase 1-4 response shapes.
     """
     out = {
         "id": str(doc["_id"]),
@@ -119,9 +151,20 @@ def serialize_transaction(doc: dict) -> dict:
         "quantity": doc["quantity"],
         "transaction_value": doc["transaction_value"],
         "status": doc["status"],
+        "account_id": doc.get("account_id", "UNKNOWN"),  # .get() for pre-Phase-6 documents
     }
 
-    for field in ("risk_score", "risk_level", "decision", "fraud_reasons", "processed_at"):
+    for field in (
+        "risk_score",
+        "risk_level",
+        "decision",
+        "fraud_reasons",
+        "processed_at",
+        "individual_score",
+        "behavioral_score",
+        "combined_score",
+        "behavioral_signals",
+    ):
         if field in doc:
             out[field] = doc[field]
 
