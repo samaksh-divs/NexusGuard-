@@ -1,92 +1,57 @@
 """
-NexusGuard transaction consumer.
+NexusGuard Transaction Consumer
 
-Pipeline:
-    RabbitMQ
-        ↓
-    Validation
-        ↓
-    Duplicate Guard
-        ↓
-    Phase 5: Individual Fraud Rules
-        ↓
-    Phase 6: Behavioral Fraud Analysis
-        ↓
-    Phase 6: Combined Rule Score
-        ↓
-    Phase 7: ML Ensemble
-        ├── Random Forest
-        ├── XGBoost
-        └── LSTM
-        ↓
-    Final Risk Decision
-        ↓
-    MongoDB
-        ↓
-    ACK
-
-Any processing failure is rejected with requeue=False and
-automatically routed to the RabbitMQ Dead Letter Queue (DLQ).
+Consumes transactions from RabbitMQ, evaluates fraud/risk,
+runs the ML ensemble, stores the transaction in MongoDB,
+and creates operational alerts for HIGH/BLOCK decisions.
 """
 
 import json
 import logging
+from typing import Any
 
-from pika.adapters.blocking_connection import BlockingChannel
-from pika.spec import Basic, BasicProperties
-from pydantic import ValidationError
-
-from app.config.settings import settings
-from app.database.repositories import (
-    DuplicateTransactionError,
-    get_account_history,
-    get_transaction,
-    insert_transaction,
-)
-from app.fraud.behavior import analyze_behavior
-from app.fraud.engine import calculate_risk_score, combine_scores
-from app.ml.service import MLService
-from app.validation.schemas import TransactionCreate
+from app.alerts.service import create_alert_for_transaction
+from app.config import settings
+from app.database.repositories import insert_transaction
 
 
 logger = logging.getLogger(__name__)
 
 
 # ================================================================
-# PHASE 7 — ML SERVICE
+# LOGGING
 # ================================================================
 
-# Load RF + XGBoost + LSTM only once when the worker starts.
-ml_service = MLService()
-
-
-# ================================================================
-# TEST-ONLY DLQ TRIGGER
-# ================================================================
-
-TEST_FAILURE_STATUS = "force_fail_test"
-
-
-def _is_test_failure_trigger(
-    transaction: TransactionCreate,
-) -> bool:
-    return transaction.status == TEST_FAILURE_STATUS
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 
 # ================================================================
-# FINAL RISK CALCULATION
+# ML IMPORTS
+# ================================================================
+
+try:
+    from app.ml.service import (
+        load_models,
+        predict_transaction_risk,
+    )
+
+except ImportError:
+    load_models = None
+    predict_transaction_risk = None
+
+
+# ================================================================
+# RISK SCORING
 # ================================================================
 
 def calculate_final_ml_risk(
     rule_score: float,
     ml_score: float,
+    critical_rule_triggered: bool = False,
 ) -> tuple[float, str, str]:
-    """
-    Combine Phase 6 rule/behavior score with Phase 7 ML score.
-
-    Rule/behavior score = 40%
-    ML ensemble = 60%
-    """
 
     final_score = (
         0.40 * float(rule_score)
@@ -106,588 +71,723 @@ def calculate_final_ml_risk(
         )
     )
 
-    if final_score >= 80:
+    # ------------------------------------------------------------
+    # CRITICAL FRAUD OVERRIDE
+    # ------------------------------------------------------------
 
-        risk_level = "HIGH"
-        decision = "BLOCK"
+    if critical_rule_triggered:
 
-    elif final_score >= 50:
+        final_score = max(
+            final_score,
+            80.0,
+        )
 
-        risk_level = "MEDIUM"
-        decision = "REVIEW"
+        return (
+            float(round(final_score, 2)),
+            "HIGH",
+            "BLOCK",
+        )
 
-    else:
+    # ------------------------------------------------------------
+    # NORMAL THRESHOLDS
+    # ------------------------------------------------------------
 
-        risk_level = "LOW"
-        decision = "APPROVE"
+    if final_score >= 80.0:
 
-    return final_score, risk_level, decision
+        return (
+            final_score,
+            "HIGH",
+            "BLOCK",
+        )
+
+    if final_score >= 50.0:
+
+        return (
+            final_score,
+            "MEDIUM",
+            "REVIEW",
+        )
+
+    return (
+        final_score,
+        "LOW",
+        "APPROVE",
+    )
 
 
 # ================================================================
-# RABBITMQ MESSAGE HANDLER
+# HELPERS
+# ================================================================
+
+def _get_value(
+    data: dict[str, Any],
+    *names: str,
+    default: Any = None,
+) -> Any:
+
+    for name in names:
+
+        if name in data:
+
+            return data[name]
+
+    return default
+
+
+# ================================================================
+# RULE ENGINE
+# ================================================================
+
+def _calculate_rule_score(
+    transaction: dict[str, Any],
+) -> tuple[
+    float,
+    float,
+    float,
+    list[str],
+]:
+
+    reasons: list[str] = []
+
+    # ------------------------------------------------------------
+    # AMOUNT
+    # ------------------------------------------------------------
+
+    amount = float(
+        _get_value(
+            transaction,
+            "amount",
+            "transaction_amount",
+            "value",
+            "price",
+            default=0.0,
+        )
+        or 0.0
+    )
+
+    # ------------------------------------------------------------
+    # QUANTITY
+    # ------------------------------------------------------------
+
+    quantity = float(
+        _get_value(
+            transaction,
+            "quantity",
+            "qty",
+            default=0.0,
+        )
+        or 0.0
+    )
+
+    # ------------------------------------------------------------
+    # SYMBOL
+    # ------------------------------------------------------------
+
+    symbol = str(
+        _get_value(
+            transaction,
+            "symbol",
+            "description",
+            default="",
+        )
+        or ""
+    )
+
+    # ------------------------------------------------------------
+    # INDIVIDUAL FRAUD SCORE
+    # ------------------------------------------------------------
+
+    individual_score = 0.0
+
+    if amount >= 50000:
+
+        individual_score += 25.0
+
+        reasons.append(
+            "High transaction value"
+        )
+
+    if amount >= 100000:
+
+        individual_score += 25.0
+
+        reasons.append(
+            "Very high transaction value"
+        )
+
+    if quantity >= 5:
+
+        individual_score += 25.0
+
+        reasons.append(
+            "High transaction quantity"
+        )
+
+    suspicious_symbols = {
+        "TEST_FRAUD",
+        "FRAUD",
+        "SCAM",
+        "BLACKLIST",
+    }
+
+    if symbol.upper() in suspicious_symbols:
+
+        individual_score += 25.0
+
+        reasons.append(
+            "Suspicious transaction symbol"
+        )
+
+    individual_score = min(
+        individual_score,
+        100.0,
+    )
+
+    # ------------------------------------------------------------
+    # BEHAVIORAL SCORE
+    # ------------------------------------------------------------
+
+    behavioral_score = float(
+        transaction.get(
+            "behavioral_score",
+            0.0,
+        )
+        or 0.0
+    )
+
+    behavioral_score = min(
+        max(
+            behavioral_score,
+            0.0,
+        ),
+        100.0,
+    )
+
+    # ------------------------------------------------------------
+    # COMBINED RULE SCORE
+    # ------------------------------------------------------------
+
+    combined_score = float(
+        round(
+            (
+                0.60 * individual_score
+                + 0.40 * behavioral_score
+            ),
+            2,
+        )
+    )
+
+    return (
+        individual_score,
+        behavioral_score,
+        combined_score,
+        reasons,
+    )
+
+
+# ================================================================
+# ML PREDICTION
+# ================================================================
+
+def _run_ml_prediction(
+    transaction: dict[str, Any],
+) -> tuple[
+    float,
+    float,
+    float,
+    float,
+]:
+
+    # ------------------------------------------------------------
+    # ML SERVICE UNAVAILABLE
+    # ------------------------------------------------------------
+
+    if predict_transaction_risk is None:
+
+        logger.warning(
+            "[ML] Prediction service unavailable. "
+            "Using ML score of 0."
+        )
+
+        return (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
+    # ------------------------------------------------------------
+    # CALL ML SERVICE
+    # ------------------------------------------------------------
+
+    result = predict_transaction_risk(
+        transaction
+    )
+
+    # ------------------------------------------------------------
+    # DICTIONARY RESULT
+    #
+    # app.ml.ensemble.MLEnsemble.predict() returns:
+    #
+    # {
+    #     "rf_probability": ...,
+    #     "xgb_probability": ...,
+    #     "lstm_probability": ...,
+    #     "final_probability": ...,
+    #     "risk_score": ...,
+    #     "risk_level": ...,
+    #     "decision": ...
+    # }
+    # ------------------------------------------------------------
+
+    if isinstance(result, dict):
+
+        rf = float(
+            result.get(
+                "rf_probability",
+                0.0,
+            )
+        )
+
+        xgb = float(
+            result.get(
+                "xgb_probability",
+                0.0,
+            )
+        )
+
+        lstm = float(
+            result.get(
+                "lstm_probability",
+                0.0,
+            )
+        )
+
+        final = float(
+            result.get(
+                "final_probability",
+                0.0,
+            )
+        )
+
+        logger.info(
+            "[ML] Prediction received: "
+            "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
+            rf,
+            xgb,
+            lstm,
+            final,
+        )
+
+        return (
+            rf,
+            xgb,
+            lstm,
+            final,
+        )
+
+    # ------------------------------------------------------------
+    # TUPLE / LIST RESULT
+    #
+    # Backward-compatible fallback.
+    # ------------------------------------------------------------
+
+    if (
+        isinstance(
+            result,
+            (tuple, list),
+        )
+        and len(result) >= 4
+    ):
+
+        rf = float(result[0])
+        xgb = float(result[1])
+        lstm = float(result[2])
+        final = float(result[3])
+
+        logger.info(
+            "[ML] Tuple/list prediction received: "
+            "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
+            rf,
+            xgb,
+            lstm,
+            final,
+        )
+
+        return (
+            rf,
+            xgb,
+            lstm,
+            final,
+        )
+
+    raise RuntimeError(
+        "Unexpected ML prediction result format."
+    )
+
+
+# ================================================================
+# TRANSACTION HANDLER
 # ================================================================
 
 def handle_message(
-    channel: BlockingChannel,
-    method: Basic.Deliver,
-    properties: BasicProperties,
-    body: bytes,
+    transaction: dict[str, Any],
 ) -> None:
 
-    transaction_id = None
-
-    # ============================================================
-    # STEP 1 — DECODE + VALIDATE
-    # ============================================================
-
-    try:
-
-        raw = json.loads(
-            body.decode("utf-8")
-        )
-
-        transaction = TransactionCreate(
-            **raw
-        )
-
-        transaction_id = transaction.transaction_id
-
-        logger.info(
-            "[WORKER] Received transaction: %s",
-            transaction_id,
-        )
-
-    except (
-        json.JSONDecodeError,
-        ValidationError,
-    ):
-
-        logger.exception(
-            "[WORKER] Processing failed: malformed message"
-        )
-
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
-
-        logger.warning(
-            "[WORKER] Message routed to DLQ"
-        )
-
-        return
-
-    # ============================================================
-    # STEP 2 — TEST DLQ
-    # ============================================================
-
-    if _is_test_failure_trigger(transaction):
-
-        logger.warning(
-            "[WORKER] Intentional DLQ test: %s",
-            transaction_id,
-        )
-
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
-
-        logger.warning(
-            "[WORKER] Message routed to DLQ: %s",
-            transaction_id,
-        )
-
-        return
-
-    # ============================================================
-    # STEP 3 — DUPLICATE TRANSACTION GUARD
-    # ============================================================
-
-    try:
-
-        existing_transaction = get_transaction(
-            transaction_id
-        )
-
-        if existing_transaction is not None:
-
-            logger.warning(
-                "[WORKER] Transaction already processed: %s. "
-                "Skipping duplicate.",
-                transaction_id,
-            )
-
-            channel.basic_ack(
-                delivery_tag=method.delivery_tag,
-            )
-
-            logger.info(
-                "[WORKER] Duplicate ACK sent: %s",
-                transaction_id,
-            )
-
-            return
-
-    except Exception:
-
-        logger.exception(
-            "[WORKER] Failed duplicate check: %s",
-            transaction_id,
-        )
-
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
-
-        logger.warning(
-            "[WORKER] Duplicate-check failure routed to DLQ: %s",
-            transaction_id,
-        )
-
-        return
-
-    # ============================================================
-    # STEP 4 — FRAUD + BEHAVIORAL + ML ANALYSIS
-    # ============================================================
-
-    try:
-
-        # --------------------------------------------------------
-        # Transaction value
-        # --------------------------------------------------------
-
-        transaction_value = float(
-            round(
-                transaction.price
-                * transaction.quantity,
-                8,
-            )
-        )
-
-        # --------------------------------------------------------
-        # Phase 5 — Individual Fraud Engine
-        # --------------------------------------------------------
-
-        # Transaction has already passed the duplicate guard.
-        is_duplicate = False
-
-        individual_result = calculate_risk_score(
-
-            transaction_value=transaction_value,
-
-            quantity=transaction.quantity,
-
-            symbol=transaction.symbol,
-
-            is_duplicate=is_duplicate,
-
-            high_value_threshold=(
-                settings.fraud_high_value_threshold
-            ),
-
-            very_high_value_threshold=(
-                settings.fraud_very_high_value_threshold
-            ),
-
-            high_quantity_threshold=(
-                settings.fraud_high_quantity_threshold
-            ),
-
-            suspicious_symbols=(
-                settings.suspicious_symbols_set
-            ),
-        )
-
-        individual_score = float(
-            individual_result.risk_score
-        )
-
-        logger.info(
-            "[WORKER] Individual fraud score=%s",
-            individual_score,
-        )
-
-        # --------------------------------------------------------
-        # Phase 6 — Behavioral Analysis
-        # --------------------------------------------------------
-
-        history = get_account_history(
-
-            transaction.account_id,
-
-            exclude_transaction_id=transaction_id,
-
-            limit=settings.behavior_history_lookback,
-        )
-
-        behavioral_result = analyze_behavior(
-
-            current_timestamp=transaction.timestamp,
-
-            current_value=transaction_value,
-
-            current_symbol=transaction.symbol,
-
-            history=history,
-
-            velocity_window_seconds=(
-                settings.behavior_velocity_window_seconds
-            ),
-
-            velocity_max_transactions=(
-                settings.behavior_velocity_max_transactions
-            ),
-
-            frequency_window_minutes=(
-                settings.behavior_frequency_window_minutes
-            ),
-
-            frequency_baseline_window_minutes=(
-                settings.behavior_frequency_baseline_window_minutes
-            ),
-
-            frequency_multiplier=(
-                settings.behavior_frequency_multiplier
-            ),
-
-            value_deviation_multiplier=(
-                settings.behavior_value_deviation_multiplier
-            ),
-
-            value_unusual_multiplier=(
-                settings.behavior_value_unusual_multiplier
-            ),
-
-            min_history_for_symbol_check=(
-                settings.behavior_min_history_for_symbol_check
-            ),
-        )
-
-        behavioral_score = float(
-            behavioral_result.score
-        )
-
-        logger.info(
-            "[WORKER] Behavioral score=%s",
-            behavioral_score,
-        )
-
-        # --------------------------------------------------------
-        # Phase 6 — Combine rule + behavioral scores
-        # --------------------------------------------------------
-
-        (
-            combined_score,
-            combined_level,
-            combined_decision,
-        ) = combine_scores(
-
-            individual_score,
-
-            behavioral_score,
-
-            settings.fraud_individual_weight,
-
-            settings.fraud_behavioral_weight,
-        )
-
-        combined_score = float(
-            combined_score
-        )
-
-        logger.info(
-            "[WORKER] Rule combined score=%s",
-            combined_score,
-        )
-
-        # ========================================================
-        # PHASE 7 — ML ENSEMBLE
-        # ========================================================
-
-        ml_result = ml_service.predict_transaction(
-
-            transaction_value=transaction_value,
-
-            quantity=transaction.quantity,
-
-            symbol=transaction.symbol,
-
-            risk_score=combined_score,
-
-            behavioral_score=behavioral_score,
-        )
-
-        # ========================================================
-        # Convert ML values to native Python types
-        # ========================================================
-
-        ml_rf_probability = float(
-            ml_result["rf_probability"]
-        )
-
-        ml_xgb_probability = float(
-            ml_result["xgb_probability"]
-        )
-
-        ml_lstm_probability = float(
-            ml_result["lstm_probability"]
-        )
-
-        ml_probability = float(
-            ml_result["final_probability"]
-        )
-
-        ml_risk_score = float(
-            ml_result["risk_score"]
-        )
-
-        logger.info(
-            "[WORKER] ML Ensemble: "
-            "RF=%s XGB=%s LSTM=%s FINAL=%s",
-            ml_rf_probability,
-            ml_xgb_probability,
-            ml_lstm_probability,
-            ml_probability,
-        )
-
-        # --------------------------------------------------------
-        # Convert ML probability into 0-100 score
-        # --------------------------------------------------------
-
-        ml_score = float(
-            ml_probability * 100.0
-        )
-
-        # ========================================================
-        # PHASE 7 — FINAL DECISION
-        # ========================================================
-
-        (
-            final_score,
-            final_level,
-            final_decision,
-        ) = calculate_final_ml_risk(
-
-            rule_score=combined_score,
-
-            ml_score=ml_score,
-        )
-
-        logger.info(
-            "[WORKER] FINAL RISK: "
-            "score=%s level=%s decision=%s",
-            final_score,
-            final_level,
-            final_decision,
-        )
-
-        # ========================================================
-        # STEP 5 — MONGODB STORAGE
-        # ========================================================
-
-        fraud_storage = {
-
-            # ----------------------------------------------------
-            # Final decision
-            # ----------------------------------------------------
-
-            "risk_score": float(
-                final_score
-            ),
-
-            "risk_level": final_level,
-
-            "decision": final_decision,
-
-            # ----------------------------------------------------
-            # Phase 5
-            # ----------------------------------------------------
-
-            "fraud_reasons": (
-                individual_result.reasons
-            ),
-
-            "individual_score": (
-                float(individual_score)
-            ),
-
-            # ----------------------------------------------------
-            # Phase 6
-            # ----------------------------------------------------
-
-            "behavioral_score": (
-                float(behavioral_score)
-            ),
-
-            "combined_score": (
-                float(combined_score)
-            ),
-
-            "behavioral_signals": [
-                signal.to_dict()
-                for signal in behavioral_result.signals
-            ],
-
-            # ----------------------------------------------------
-            # Phase 7 — Individual ML outputs
-            # ----------------------------------------------------
-
-            "ml_rf_probability": (
-                ml_rf_probability
-            ),
-
-            "ml_xgb_probability": (
-                ml_xgb_probability
-            ),
-
-            "ml_lstm_probability": (
-                ml_lstm_probability
-            ),
-
-            # ----------------------------------------------------
-            # Phase 7 — ML ensemble
-            # ----------------------------------------------------
-
-            "ml_probability": (
-                ml_probability
-            ),
-
-            "ml_risk_score": (
-                ml_risk_score
-            ),
-
-            "ml_risk_level": (
-                ml_result["risk_level"]
-            ),
-
-            "ml_decision": (
-                ml_result["decision"]
-            ),
-
-            # ----------------------------------------------------
-            # Phase 7 — Final combined decision
-            # ----------------------------------------------------
-
-            "final_risk_score": (
-                float(final_score)
-            ),
-
-            "final_risk_level": (
-                final_level
-            ),
-
-            "final_decision": (
-                final_decision
-            ),
-        }
-
-        # --------------------------------------------------------
-        # Store everything in ONE transaction document
-        # --------------------------------------------------------
-
-        insert_transaction(
+    transaction_id = str(
+        _get_value(
             transaction,
-            fraud_result=fraud_storage,
+            "transaction_id",
+            "id",
+            default="UNKNOWN",
         )
+    )
 
-        logger.info(
-            "[WORKER] Transaction stored successfully: %s",
-            transaction_id,
+    account_id = str(
+        _get_value(
+            transaction,
+            "account_id",
+            "user_id",
+            "customer_id",
+            default="UNKNOWN",
         )
-
-    # ============================================================
-    # STEP 6 — DUPLICATE RACE CONDITION
-    # ============================================================
-
-    except DuplicateTransactionError:
-
-        logger.warning(
-            "[WORKER] Transaction already processed "
-            "by another worker: %s",
-            transaction_id,
-        )
-
-        channel.basic_ack(
-            delivery_tag=method.delivery_tag,
-        )
-
-        logger.info(
-            "[WORKER] Duplicate ACK sent: %s",
-            transaction_id,
-        )
-
-        return
-
-    # ============================================================
-    # STEP 7 — UNEXPECTED FAILURE → DLQ
-    # ============================================================
-
-    except Exception:
-
-        logger.exception(
-            "[WORKER] Processing failed: %s",
-            transaction_id,
-        )
-
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
-
-        logger.warning(
-            "[WORKER] Message routed to DLQ: %s",
-            transaction_id,
-        )
-
-        return
-
-    # ============================================================
-    # STEP 8 — SUCCESSFUL ACK
-    # ============================================================
-
-    channel.basic_ack(
-        delivery_tag=method.delivery_tag,
     )
 
     logger.info(
-        "[WORKER] ACK sent: %s",
+        "[WORKER] Received transaction: %s",
         transaction_id,
     )
 
+    # ============================================================
+    # RULE ENGINE
+    # ============================================================
+
+    (
+        individual_score,
+        behavioral_score,
+        combined_score,
+        reasons,
+    ) = _calculate_rule_score(
+        transaction
+    )
+
+    logger.info(
+        "[WORKER] Individual fraud score=%.1f",
+        individual_score,
+    )
+
+    logger.info(
+        "[WORKER] Behavioral score=%.1f",
+        behavioral_score,
+    )
+
+    logger.info(
+        "[WORKER] Rule combined score=%.1f",
+        combined_score,
+    )
+
+    # ============================================================
+    # ML ENSEMBLE
+    # ============================================================
+
+    (
+        rf_score,
+        xgb_score,
+        lstm_score,
+        ml_probability,
+    ) = _run_ml_prediction(
+        transaction
+    )
+
+    logger.info(
+        "[WORKER] ML Ensemble: "
+        "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
+        rf_score,
+        xgb_score,
+        lstm_score,
+        ml_probability,
+    )
+
+    # Convert ML probability (0-1)
+    # into ML risk score (0-100).
+
+    ml_score = float(
+        ml_probability * 100.0
+    )
+
+    logger.info(
+        "[WORKER] ML Risk Score=%.2f",
+        ml_score,
+    )
+
+    # ============================================================
+    # CRITICAL RISK
+    # ============================================================
+
+    transaction_value = float(
+        _get_value(
+            transaction,
+            "amount",
+            "transaction_amount",
+            "value",
+            "price",
+            default=0.0,
+        )
+        or 0.0
+    )
+
+    very_high_threshold = float(
+        getattr(
+            settings,
+            "fraud_very_high_value_threshold",
+            100000.0,
+        )
+    )
+
+    critical_rule_triggered = (
+        individual_score >= 75.0
+        and transaction_value >= very_high_threshold
+    )
+
+    logger.info(
+        "[WORKER] Critical rule check: "
+        "triggered=%s amount=%.2f threshold=%.2f",
+        critical_rule_triggered,
+        transaction_value,
+        very_high_threshold,
+    )
+
+    if critical_rule_triggered:
+
+        reasons.append(
+            "Critical fraud rule triggered: "
+            "high fraud score with very high transaction value"
+        )
+
+    # ============================================================
+    # FINAL RISK
+    # ============================================================
+
+    (
+        final_score,
+        final_level,
+        final_decision,
+    ) = calculate_final_ml_risk(
+        rule_score=combined_score,
+        ml_score=ml_score,
+        critical_rule_triggered=critical_rule_triggered,
+    )
+
+    logger.info(
+        "[WORKER] FINAL RISK: "
+        "score=%.2f level=%s decision=%s",
+        final_score,
+        final_level,
+        final_decision,
+    )
+
+    # ============================================================
+    # STORE TRANSACTION
+    # ============================================================
+
+    stored_transaction = dict(
+        transaction
+    )
+
+    stored_transaction.update(
+        {
+            "transaction_id": transaction_id,
+            "account_id": account_id,
+
+            # Rule-based fraud results
+            "individual_fraud_score": individual_score,
+            "behavioral_score": behavioral_score,
+            "rule_combined_score": combined_score,
+
+            # ML ensemble results
+            "ml_rf_score": rf_score,
+            "ml_xgb_score": xgb_score,
+            "ml_lstm_score": lstm_score,
+            "ml_final_probability": ml_probability,
+            "ml_score": ml_score,
+
+            # Final risk decision
+            "final_risk_score": final_score,
+            "risk_level": final_level,
+            "decision": final_decision,
+            "risk_reasons": reasons,
+        }
+    )
+
+    insert_transaction(
+        stored_transaction
+    )
+
+    logger.info(
+        "[WORKER] Transaction stored successfully: %s",
+        transaction_id,
+    )
+
+    # ============================================================
+    # OPERATIONAL ALERT
+    # ============================================================
+
+    if (
+        final_level == "HIGH"
+        or final_decision == "BLOCK"
+    ):
+
+        try:
+
+            alert = create_alert_for_transaction(
+                transaction_id=transaction_id,
+                account_id=account_id,
+                risk_score=final_score,
+                risk_level=final_level,
+                decision=final_decision,
+                reasons=reasons,
+            )
+
+            logger.info(
+                "[WORKER] Operational alert created: "
+                "transaction_id=%s alert_id=%s",
+                transaction_id,
+                alert.get("alert_id"),
+            )
+
+        except Exception:
+
+            logger.exception(
+                "[WORKER] Failed to create operational alert: "
+                "transaction_id=%s",
+                transaction_id,
+            )
+
+    else:
+
+        logger.info(
+            "[WORKER] No operational alert required: "
+            "transaction_id=%s risk_level=%s decision=%s",
+            transaction_id,
+            final_level,
+            final_decision,
+        )
+
 
 # ================================================================
-# START CONSUMER
+# RABBITMQ CALLBACK
+# ================================================================
+
+def _callback(
+    ch,
+    method,
+    properties,
+    body,
+):
+
+    transaction_id = "UNKNOWN"
+
+    try:
+
+        if isinstance(
+            body,
+            bytes,
+        ):
+
+            body = body.decode(
+                "utf-8"
+            )
+
+        transaction = json.loads(
+            body
+        )
+
+        if not isinstance(
+            transaction,
+            dict,
+        ):
+
+            raise ValueError(
+                "RabbitMQ message payload must be a JSON object."
+            )
+
+        transaction_id = str(
+            transaction.get(
+                "transaction_id",
+                "UNKNOWN",
+            )
+        )
+
+        handle_message(
+            transaction
+        )
+
+        # --------------------------------------------------------
+        # SUCCESS → ACK
+        # --------------------------------------------------------
+
+        ch.basic_ack(
+            delivery_tag=method.delivery_tag
+        )
+
+        logger.info(
+            "[WORKER] ACK sent: %s",
+            transaction_id,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "[WORKER] Failed processing transaction: %s",
+            transaction_id,
+        )
+
+        # --------------------------------------------------------
+        # FAILURE → DLQ
+        # --------------------------------------------------------
+
+        try:
+
+            ch.basic_nack(
+                delivery_tag=method.delivery_tag,
+                requeue=False,
+            )
+
+            logger.error(
+                "[WORKER] Message rejected and routed to DLQ: %s",
+                transaction_id,
+            )
+
+        except Exception:
+
+            logger.exception(
+                "[WORKER] Failed to NACK message: %s",
+                transaction_id,
+            )
+
+
+# ================================================================
+# CONSUMER STARTUP
 # ================================================================
 
 def start_consuming(
-    channel: BlockingChannel,
+    channel,
 ) -> None:
 
     channel.basic_qos(
-        prefetch_count=(
-            settings.rabbitmq_prefetch_count
-        ),
+        prefetch_count=1
     )
 
     channel.basic_consume(
-
-        queue=settings.rabbitmq_queue,
-
-        on_message_callback=handle_message,
-
+        queue="transaction_queue",
+        on_message_callback=_callback,
         auto_ack=False,
     )
 
     logger.info(
-        "Worker consuming from '%s' "
-        "(prefetch_count=%s). Waiting for messages...",
-
-        settings.rabbitmq_queue,
-
-        settings.rabbitmq_prefetch_count,
+        "Worker consuming from "
+        "'transaction_queue' "
+        "(prefetch_count=1). Waiting for messages..."
     )
 
     channel.start_consuming()

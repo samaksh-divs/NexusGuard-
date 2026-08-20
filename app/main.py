@@ -1,7 +1,7 @@
 """
 NexusGuard — FastAPI entry point.
 
-Phase 8:
+Phase 9C:
   - MongoDB lifecycle
   - RabbitMQ publisher lifecycle
   - Asynchronous transaction publishing
@@ -12,6 +12,9 @@ Phase 8:
   - DLQ-backed worker processing
   - Phase 8 dashboard API
   - Phase 8 frontend CORS support
+  - Phase 9 alert management
+  - Phase 9 alert REST API
+  - Phase 9 alert dashboard API
 """
 
 import logging
@@ -20,6 +23,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.alerts.service import ensure_alert_indexes
+from app.api.alert_dashboard import (
+    router as alert_dashboard_router,
+)
 from app.api.dashboard import router as dashboard_router
 from app.config.settings import settings
 from app.database.mongodb import (
@@ -65,14 +72,17 @@ async def lifespan(app: FastAPI):
     Application startup/shutdown lifecycle.
     """
 
-    logger.info("Starting NexusGuard Phase 8...")
+    logger.info("Starting NexusGuard Phase 9C...")
 
     try:
+
         # --------------------------------------------------------
         # MongoDB
         # --------------------------------------------------------
 
         connect_to_mongo()
+
+        ensure_alert_indexes()
 
         logger.info(
             "MongoDB connection initialized"
@@ -89,7 +99,7 @@ async def lifespan(app: FastAPI):
         )
 
         logger.info(
-            "NexusGuard Phase 8 startup complete"
+            "NexusGuard Phase 9C startup complete"
         )
 
         yield
@@ -142,10 +152,10 @@ app = FastAPI(
     description=(
         "Real-time cryptocurrency transaction fraud detection "
         "platform using MongoDB, RabbitMQ, behavioral fraud "
-        "detection, Random Forest, XGBoost, LSTM, and "
-        "a Phase 8 security dashboard."
+        "detection, Random Forest, XGBoost, LSTM, a Phase 8 "
+        "security dashboard, and Phase 9 alert management."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 
@@ -176,6 +186,15 @@ app.include_router(
 
 
 # ================================================================
+# PHASE 9C ALERT DASHBOARD ROUTER
+# ================================================================
+
+app.include_router(
+    alert_dashboard_router
+)
+
+
+# ================================================================
 # ROOT
 # ================================================================
 
@@ -189,10 +208,11 @@ def read_root():
         "project": settings.app_name,
         "status": "running",
         "phase": (
-            "8 - Dashboard + ML ensemble "
-            "+ final risk decision"
+            "9C - Dashboard + ML ensemble "
+            "+ final risk decision + alerts"
         ),
         "dashboard": "enabled",
+        "alerts": "enabled",
         "architecture": {
             "database": "MongoDB",
             "message_broker": "RabbitMQ",
@@ -203,6 +223,7 @@ def read_root():
                 "LSTM",
             ],
             "dashboard": "Phase 8",
+            "alert_management": "Phase 9",
         },
     }
 
@@ -240,7 +261,9 @@ def health_check():
 
         "dashboard": "enabled",
 
-        "phase": "8",
+        "alerts": "enabled",
+
+        "phase": "9C",
     }
 
 
@@ -310,40 +333,6 @@ async def publish_test_transaction(
 ):
     """
     Publish a transaction to RabbitMQ.
-
-    Pipeline:
-
-        FastAPI
-           ↓
-        RabbitMQ Exchange
-           ↓
-        transaction_queue
-           ↓
-        Transaction Worker
-           ↓
-        Validation
-           ↓
-        Individual Fraud Rules
-           ↓
-        Behavioral Analysis
-           ↓
-        RF + XGBoost + LSTM
-           ↓
-        Final Risk Decision
-           ↓
-        MongoDB
-           ↓
-        ACK
-
-    Failed processing:
-
-        Worker
-           ↓
-        NACK (requeue=False)
-           ↓
-        Dead Letter Exchange
-           ↓
-        transaction_dlq
     """
 
     payload = transaction.model_dump(
@@ -412,7 +401,6 @@ def list_transactions(
         )
 
     if limit > 500:
-
         limit = 500
 
     docs = get_transactions(
@@ -478,6 +466,8 @@ def read_transaction_risk(
         Phase 6
         Phase 7 ML
         Final decision
+
+    Supports both old and current ML field names.
     """
 
     doc = get_transaction(
@@ -495,7 +485,61 @@ def read_transaction_risk(
             ),
         )
 
-    if "risk_score" not in doc:
+    # ------------------------------------------------------------
+    # CURRENT ML FIELD MAPPING
+    # ------------------------------------------------------------
+
+    ml_rf_probability = doc.get(
+        "ml_rf_score",
+        doc.get(
+            "ml_rf_probability"
+        ),
+    )
+
+    ml_xgb_probability = doc.get(
+        "ml_xgb_score",
+        doc.get(
+            "ml_xgb_probability"
+        ),
+    )
+
+    ml_lstm_probability = doc.get(
+        "ml_lstm_score",
+        doc.get(
+            "ml_lstm_probability"
+        ),
+    )
+
+    ml_probability = doc.get(
+        "ml_final_probability",
+        doc.get(
+            "ml_probability"
+        ),
+    )
+
+    ml_risk_score = doc.get(
+        "ml_score",
+        doc.get(
+            "ml_risk_score"
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # DETERMINE WHETHER ANY ANALYSIS EXISTS
+    # ------------------------------------------------------------
+
+    has_risk_analysis = any(
+        field in doc
+        for field in (
+            "risk_score",
+            "final_risk_score",
+            "individual_fraud_score",
+            "ml_final_probability",
+            "ml_probability",
+        )
+    )
+
+    if not has_risk_analysis:
 
         raise HTTPException(
             status_code=404,
@@ -506,17 +550,37 @@ def read_transaction_risk(
             ),
         )
 
+    # ------------------------------------------------------------
+    # BEHAVIORAL SIGNALS
+    # ------------------------------------------------------------
+
     behavioral_signals = doc.get(
         "behavioral_signals",
         [],
     )
 
-    reasons = list(
+    # ------------------------------------------------------------
+    # REASONS
+    # ------------------------------------------------------------
+
+    reasons = []
+
+    stored_reasons = doc.get(
+        "risk_reasons",
         doc.get(
             "fraud_reasons",
             [],
-        )
+        ),
     )
+
+    if isinstance(
+        stored_reasons,
+        list,
+    ):
+
+        reasons.extend(
+            stored_reasons
+        )
 
     for signal in behavioral_signals:
 
@@ -529,11 +593,15 @@ def read_transaction_risk(
                 "message"
             )
 
-            if message:
+            if message and message not in reasons:
 
                 reasons.append(
                     message
                 )
+
+    # ------------------------------------------------------------
+    # RETURN COMPLETE RISK ANALYSIS
+    # ------------------------------------------------------------
 
     return {
 
@@ -558,15 +626,21 @@ def read_transaction_risk(
 
         "individual_score": (
             doc.get(
-                "individual_score",
-                0,
+                "individual_fraud_score",
+                doc.get(
+                    "individual_score",
+                    0,
+                ),
             )
         ),
 
         "fraud_reasons": (
             doc.get(
                 "fraud_reasons",
-                [],
+                doc.get(
+                    "risk_reasons",
+                    [],
+                ),
             )
         ),
 
@@ -583,10 +657,13 @@ def read_transaction_risk(
 
         "combined_score": (
             doc.get(
-                "combined_score",
+                "rule_combined_score",
                 doc.get(
-                    "risk_score",
-                    0,
+                    "combined_score",
+                    doc.get(
+                        "risk_score",
+                        0,
+                    ),
                 ),
             )
         ),
@@ -600,44 +677,45 @@ def read_transaction_risk(
         # --------------------------------------------------------
 
         "ml_rf_probability": (
-            doc.get(
-                "ml_rf_probability"
-            )
+            ml_rf_probability
         ),
 
         "ml_xgb_probability": (
-            doc.get(
-                "ml_xgb_probability"
-            )
+            ml_xgb_probability
         ),
 
         "ml_lstm_probability": (
-            doc.get(
-                "ml_lstm_probability"
-            )
+            ml_lstm_probability
         ),
 
         "ml_probability": (
-            doc.get(
-                "ml_probability"
-            )
+            ml_probability
         ),
 
         "ml_risk_score": (
-            doc.get(
-                "ml_risk_score"
-            )
+            ml_risk_score
         ),
+
+        # The current worker does not store
+        # separate ML-only risk_level/decision.
+        # These are therefore exposed as the
+        # final NexusGuard decision.
 
         "ml_risk_level": (
             doc.get(
-                "ml_risk_level"
+                "ml_risk_level",
+                doc.get(
+                    "risk_level"
+                ),
             )
         ),
 
         "ml_decision": (
             doc.get(
-                "ml_decision"
+                "ml_decision",
+                doc.get(
+                    "decision"
+                ),
             )
         ),
 
@@ -647,7 +725,10 @@ def read_transaction_risk(
 
         "risk_score": (
             doc.get(
-                "risk_score"
+                "risk_score",
+                doc.get(
+                    "final_risk_score"
+                ),
             )
         ),
 
@@ -795,7 +876,23 @@ def read_transaction_ml(
     transaction_id: str,
 ):
     """
-    Return only Phase 7 ML results.
+    Return Phase 7 ML analysis.
+
+    Current worker fields:
+
+        ml_rf_score
+        ml_xgb_score
+        ml_lstm_score
+        ml_final_probability
+        ml_score
+
+    Backward-compatible fields:
+
+        ml_rf_probability
+        ml_xgb_probability
+        ml_lstm_probability
+        ml_probability
+        ml_risk_score
     """
 
     doc = get_transaction(
@@ -813,7 +910,50 @@ def read_transaction_ml(
             ),
         )
 
-    if "ml_probability" not in doc:
+    # ------------------------------------------------------------
+    # CURRENT FIELD NAMES
+    # ------------------------------------------------------------
+
+    rf_probability = doc.get(
+        "ml_rf_score",
+        doc.get(
+            "ml_rf_probability"
+        ),
+    )
+
+    xgb_probability = doc.get(
+        "ml_xgb_score",
+        doc.get(
+            "ml_xgb_probability"
+        ),
+    )
+
+    lstm_probability = doc.get(
+        "ml_lstm_score",
+        doc.get(
+            "ml_lstm_probability"
+        ),
+    )
+
+    ml_probability = doc.get(
+        "ml_final_probability",
+        doc.get(
+            "ml_probability"
+        ),
+    )
+
+    ml_risk_score = doc.get(
+        "ml_score",
+        doc.get(
+            "ml_risk_score"
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # CHECK ML ANALYSIS
+    # ------------------------------------------------------------
+
+    if ml_probability is None:
 
         raise HTTPException(
             status_code=404,
@@ -824,69 +964,99 @@ def read_transaction_ml(
             ),
         )
 
+    # ------------------------------------------------------------
+    # RETURN ML RESULTS
+    # ------------------------------------------------------------
+
     return {
 
         "transaction_id": (
             doc["transaction_id"]
         ),
 
+        # --------------------------------------------------------
+        # Individual ML Models
+        # --------------------------------------------------------
+
         "rf_probability": (
-            doc.get(
-                "ml_rf_probability"
-            )
+            rf_probability
         ),
 
         "xgb_probability": (
-            doc.get(
-                "ml_xgb_probability"
-            )
+            xgb_probability
         ),
 
         "lstm_probability": (
-            doc.get(
-                "ml_lstm_probability"
-            )
+            lstm_probability
         ),
 
+        # --------------------------------------------------------
+        # ML Ensemble
+        # --------------------------------------------------------
+
         "ml_probability": (
-            doc.get(
-                "ml_probability"
-            )
+            ml_probability
         ),
 
         "ml_risk_score": (
-            doc.get(
-                "ml_risk_score"
-            )
+            ml_risk_score
         ),
+
+        # --------------------------------------------------------
+        # ML Decision
+        # --------------------------------------------------------
 
         "ml_risk_level": (
             doc.get(
-                "ml_risk_level"
+                "ml_risk_level",
+                doc.get(
+                    "risk_level"
+                ),
             )
         ),
 
         "ml_decision": (
             doc.get(
-                "ml_decision"
+                "ml_decision",
+                doc.get(
+                    "decision"
+                ),
             )
         ),
 
+        # --------------------------------------------------------
+        # FINAL NEXUSGUARD DECISION
+        # --------------------------------------------------------
+
         "final_risk_score": (
             doc.get(
-                "final_risk_score"
+                "final_risk_score",
+                doc.get(
+                    "risk_score"
+                ),
             )
         ),
 
         "final_risk_level": (
             doc.get(
-                "final_risk_level"
+                "final_risk_level",
+                doc.get(
+                    "risk_level"
+                ),
             )
         ),
 
         "final_decision": (
             doc.get(
-                "final_decision"
+                "final_decision",
+                doc.get(
+                    "decision"
+                ),
             )
         ),
     }
+
+
+# ================================================================
+# END OF APPLICATION
+# ================================================================

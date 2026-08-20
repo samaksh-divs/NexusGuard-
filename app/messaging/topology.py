@@ -1,115 +1,148 @@
 """
-RabbitMQ topology — exchange, queue, and binding declarations.
+NexusGuard RabbitMQ Topology
 
-Why this is separate from rabbitmq.py:
-`rabbitmq.py` only knows how to open a connection/channel. This module
-knows the actual shape of NexusGuard's messaging setup (which
-exchange, which queue, how they're bound). Keeping them apart means
-the connection logic doesn't need to change as the topology grows.
+Defines:
 
-Phase 4 adds the Dead Letter Exchange (transaction_dlx) and Dead
-Letter Queue (transaction_dlq), and — importantly — attaches
-dead-letter arguments to the EXISTING transaction_queue so that
-rejected/nacked messages are automatically routed there by RabbitMQ
-itself, rather than the worker having to manually re-publish them.
-
-IMPORTANT — one-time manual step required:
-transaction_queue was originally declared in Phase 3 WITHOUT any
-dead-letter arguments. RabbitMQ does not allow redeclaring an existing
-queue with different arguments (queue_declare is only idempotent when
-the arguments match exactly) — it raises PRECONDITION_FAILED and
-closes the channel. Since transaction_queue already exists from Phase
-3, it must be deleted once (via the management UI or rabbitmqctl)
-before running this Phase 4 code, so it can be redeclared with the
-new arguments. This does not affect MongoDB data — it only affects
-the RabbitMQ queue object itself. See the chat instructions for the
-exact one-time command.
+transaction_exchange
+        |
+        | transaction.new
+        v
+transaction_queue
+        |
+        | failed messages
+        v
+transaction_dlx
+        |
+        | transaction.failed
+        v
+transaction_dlq
 """
 
 import logging
 
-from pika.adapters.blocking_connection import BlockingChannel
-
-from app.config.settings import settings
+import pika
 
 logger = logging.getLogger(__name__)
 
 
-def declare_topology(channel: BlockingChannel) -> None:
-    """
-    Declare exchanges, queues, and bindings for both the main
-    transaction pipeline and the dead-letter pipeline. Safe to call
-    every time the app/worker starts, PROVIDED transaction_queue's
-    arguments haven't drifted from what's declared here (see the
-    module docstring for the one-time migration this phase requires).
-    """
-    # --- Main pipeline (unchanged from Phase 3) ---
-    channel.exchange_declare(
-        exchange=settings.rabbitmq_exchange,
-        exchange_type="direct",
-        durable=True,
-    )
-    logger.info("Exchange declared: %s (direct, durable)", settings.rabbitmq_exchange)
+# ================================================================
+# NAMES
+# ================================================================
 
-    # --- Dead letter pipeline (new in Phase 4) ---
-    # Declared BEFORE transaction_queue so the DLX already exists by
-    # the time we point transaction_queue at it.
+TRANSACTION_EXCHANGE = "transaction_exchange"
+TRANSACTION_QUEUE = "transaction_queue"
+TRANSACTION_ROUTING_KEY = "transaction.new"
+
+DEAD_LETTER_EXCHANGE = "transaction_dlx"
+DEAD_LETTER_QUEUE = "transaction_dlq"
+DEAD_LETTER_ROUTING_KEY = "transaction.failed"
+
+
+# ================================================================
+# TOPOLOGY
+# ================================================================
+
+def declare_topology(channel) -> None:
+    """
+    Declare the complete RabbitMQ topology.
+
+    Safe to call repeatedly because all objects are durable and
+    declarations are idempotent when their properties match.
+    """
+
+    # ------------------------------------------------------------
+    # MAIN EXCHANGE
+    # ------------------------------------------------------------
+
     channel.exchange_declare(
-        exchange=settings.rabbitmq_dlx,
+        exchange=TRANSACTION_EXCHANGE,
         exchange_type="direct",
         durable=True,
     )
-    logger.info("Dead letter exchange declared: %s (direct, durable)", settings.rabbitmq_dlx)
+
+    logger.info(
+        "Exchange declared: %s",
+        TRANSACTION_EXCHANGE,
+    )
+
+    # ------------------------------------------------------------
+    # DEAD LETTER EXCHANGE
+    # ------------------------------------------------------------
+
+    channel.exchange_declare(
+        exchange=DEAD_LETTER_EXCHANGE,
+        exchange_type="direct",
+        durable=True,
+    )
+
+    logger.info(
+        "Dead letter exchange declared: %s",
+        DEAD_LETTER_EXCHANGE,
+    )
+
+    # ------------------------------------------------------------
+    # DEAD LETTER QUEUE
+    # ------------------------------------------------------------
 
     channel.queue_declare(
-        queue=settings.rabbitmq_dlq,
+        queue=DEAD_LETTER_QUEUE,
         durable=True,
     )
-    logger.info("Dead letter queue declared: %s (durable)", settings.rabbitmq_dlq)
+
+    logger.info(
+        "Dead letter queue declared: %s",
+        DEAD_LETTER_QUEUE,
+    )
+
+    # ------------------------------------------------------------
+    # DEAD LETTER BINDING
+    # ------------------------------------------------------------
 
     channel.queue_bind(
-        exchange=settings.rabbitmq_dlx,
-        queue=settings.rabbitmq_dlq,
-        routing_key=settings.rabbitmq_dlq_routing_key,
+        exchange=DEAD_LETTER_EXCHANGE,
+        queue=DEAD_LETTER_QUEUE,
+        routing_key=DEAD_LETTER_ROUTING_KEY,
     )
+
     logger.info(
         "Dead letter queue bound: %s -> %s (routing_key=%s)",
-        settings.rabbitmq_dlx,
-        settings.rabbitmq_dlq,
-        settings.rabbitmq_dlq_routing_key,
+        DEAD_LETTER_EXCHANGE,
+        DEAD_LETTER_QUEUE,
+        DEAD_LETTER_ROUTING_KEY,
     )
 
-    # --- transaction_queue, now with dead-letter arguments ---
-    # x-dead-letter-exchange: where RabbitMQ automatically republishes
-    #   a message when it's nacked/rejected with requeue=False (or
-    #   expires via TTL, though we don't use TTL here).
-    # x-dead-letter-routing-key: the routing key used on that
-    #   republish. Without this, RabbitMQ reuses the message's
-    #   original routing key (transaction.new), which wouldn't match
-    #   transaction_dlq's binding — so we set it explicitly.
+    # ------------------------------------------------------------
+    # MAIN QUEUE
+    # ------------------------------------------------------------
+
     channel.queue_declare(
-        queue=settings.rabbitmq_queue,
+        queue=TRANSACTION_QUEUE,
         durable=True,
         arguments={
-            "x-dead-letter-exchange": settings.rabbitmq_dlx,
-            "x-dead-letter-routing-key": settings.rabbitmq_dlq_routing_key,
+            "x-dead-letter-exchange": DEAD_LETTER_EXCHANGE,
+            "x-dead-letter-routing-key": DEAD_LETTER_ROUTING_KEY,
         },
     )
+
     logger.info(
         "Queue declared: %s (durable, dead-letters to %s)",
-        settings.rabbitmq_queue,
-        settings.rabbitmq_dlx,
+        TRANSACTION_QUEUE,
+        DEAD_LETTER_EXCHANGE,
     )
+
+    # ------------------------------------------------------------
+    # MAIN QUEUE BINDING
+    # ------------------------------------------------------------
 
     channel.queue_bind(
-        exchange=settings.rabbitmq_exchange,
-        queue=settings.rabbitmq_queue,
-        routing_key=settings.rabbitmq_routing_key,
-    )
-    logger.info(
-        "Queue bound: %s -> %s (routing_key=%s)",
-        settings.rabbitmq_exchange,
-        settings.rabbitmq_queue,
-        settings.rabbitmq_routing_key,
+        exchange=TRANSACTION_EXCHANGE,
+        queue=TRANSACTION_QUEUE,
+        routing_key=TRANSACTION_ROUTING_KEY,
     )
 
+    logger.info(
+        "Queue bound: %s -> %s (routing_key=%s)",
+        TRANSACTION_EXCHANGE,
+        TRANSACTION_QUEUE,
+        TRANSACTION_ROUTING_KEY,
+    )
