@@ -326,18 +326,6 @@ def _run_ml_prediction(
 
     # ------------------------------------------------------------
     # DICTIONARY RESULT
-    #
-    # app.ml.ensemble.MLEnsemble.predict() returns:
-    #
-    # {
-    #     "rf_probability": ...,
-    #     "xgb_probability": ...,
-    #     "lstm_probability": ...,
-    #     "final_probability": ...,
-    #     "risk_score": ...,
-    #     "risk_level": ...,
-    #     "decision": ...
-    # }
     # ------------------------------------------------------------
 
     if isinstance(result, dict):
@@ -345,28 +333,43 @@ def _run_ml_prediction(
         rf = float(
             result.get(
                 "rf_probability",
-                0.0,
+                result.get(
+                    "rf",
+                    0.0,
+                ),
             )
         )
 
         xgb = float(
             result.get(
                 "xgb_probability",
-                0.0,
+                result.get(
+                    "xgb",
+                    0.0,
+                ),
             )
         )
 
         lstm = float(
             result.get(
                 "lstm_probability",
-                0.0,
+                result.get(
+                    "lstm",
+                    0.0,
+                ),
             )
         )
 
         final = float(
             result.get(
                 "final_probability",
-                0.0,
+                result.get(
+                    "probability",
+                    result.get(
+                        "final",
+                        0.0,
+                    ),
+                ),
             )
         )
 
@@ -388,8 +391,6 @@ def _run_ml_prediction(
 
     # ------------------------------------------------------------
     # TUPLE / LIST RESULT
-    #
-    # Backward-compatible fallback.
     # ------------------------------------------------------------
 
     if (
@@ -423,6 +424,34 @@ def _run_ml_prediction(
 
     raise RuntimeError(
         "Unexpected ML prediction result format."
+    )
+
+
+# ================================================================
+# ML RISK CLASSIFICATION
+# ================================================================
+
+def calculate_ml_risk(
+    ml_score: float,
+) -> tuple[str, str]:
+
+    if ml_score >= 80.0:
+
+        return (
+            "HIGH",
+            "BLOCK",
+        )
+
+    if ml_score >= 50.0:
+
+        return (
+            "MEDIUM",
+            "REVIEW",
+        )
+
+    return (
+        "LOW",
+        "APPROVE",
     )
 
 
@@ -508,16 +537,39 @@ def handle_message(
         ml_probability,
     )
 
-    # Convert ML probability (0-1)
-    # into ML risk score (0-100).
+    # ------------------------------------------------------------
+    # ML PROBABILITY → RISK SCORE
+    # ------------------------------------------------------------
 
     ml_score = float(
-        ml_probability * 100.0
+        round(
+            ml_probability * 100.0,
+            2,
+        )
     )
 
     logger.info(
         "[WORKER] ML Risk Score=%.2f",
         ml_score,
+    )
+
+    # ------------------------------------------------------------
+    # ML-ONLY DECISION
+    # ------------------------------------------------------------
+
+    (
+        ml_risk_level,
+        ml_decision,
+    ) = calculate_ml_risk(
+        ml_score
+    )
+
+    logger.info(
+        "[WORKER] ML Risk: "
+        "score=%.2f level=%s decision=%s",
+        ml_score,
+        ml_risk_level,
+        ml_decision,
     )
 
     # ============================================================
@@ -599,22 +651,51 @@ def handle_message(
             "transaction_id": transaction_id,
             "account_id": account_id,
 
-            # Rule-based fraud results
+            # ----------------------------------------------------
+            # RULE ENGINE
+            # ----------------------------------------------------
+
             "individual_fraud_score": individual_score,
             "behavioral_score": behavioral_score,
             "rule_combined_score": combined_score,
 
-            # ML ensemble results
-            "ml_rf_score": rf_score,
-            "ml_xgb_score": xgb_score,
-            "ml_lstm_score": lstm_score,
-            "ml_final_probability": ml_probability,
-            "ml_score": ml_score,
+            # ----------------------------------------------------
+            # ML ENSEMBLE
+            #
+            # IMPORTANT:
+            # These names MUST match the API/repository fields.
+            # ----------------------------------------------------
 
-            # Final risk decision
-            "final_risk_score": final_score,
+            "ml_rf_probability": rf_score,
+            "ml_xgb_probability": xgb_score,
+            "ml_lstm_probability": lstm_score,
+            "ml_probability": ml_probability,
+
+            # ML score on 0-100 scale
+            "ml_risk_score": ml_score,
+
+            # ML-only classification
+            "ml_risk_level": ml_risk_level,
+            "ml_decision": ml_decision,
+
+            # ----------------------------------------------------
+            # FINAL RISK DECISION
+            # ----------------------------------------------------
+
+            "risk_score": final_score,
             "risk_level": final_level,
             "decision": final_decision,
+
+            # Keep explicit final fields too
+            "final_risk_score": final_score,
+            "final_risk_level": final_level,
+            "final_decision": final_decision,
+
+            # ----------------------------------------------------
+            # REASONS
+            # ----------------------------------------------------
+
+            "fraud_reasons": reasons,
             "risk_reasons": reasons,
         }
     )

@@ -46,13 +46,13 @@ class MLEnsemble:
 
         print("[ML] All models loaded successfully.")
 
-    def predict_tabular(self, features):
+    def predict_tabular(
+        self,
+        features,
+    ):
 
-        # Random Forest was trained with
-        # feature_1 ... feature_165.
-        #
-        # Convert the incoming NumPy array into
-        # a DataFrame with the exact feature names.
+        # Random Forest and XGBoost were trained
+        # with feature_1 ... feature_165.
 
         feature_names = self.random_forest.feature_names_in_
 
@@ -74,7 +74,10 @@ class MLEnsemble:
             float(xgb_probability),
         )
 
-    def predict_lstm(self, sequence):
+    def predict_lstm(
+        self,
+        sequence,
+    ):
 
         sequence = np.asarray(
             sequence,
@@ -92,7 +95,9 @@ class MLEnsemble:
 
         with torch.no_grad():
 
-            output = self.lstm(tensor)
+            output = self.lstm(
+                tensor
+            )
 
             probability = torch.sigmoid(
                 output
@@ -107,7 +112,9 @@ class MLEnsemble:
     ):
 
         rf_probability, xgb_probability = (
-            self.predict_tabular(features)
+            self.predict_tabular(
+                features
+            )
         )
 
         lstm_probability = self.predict_lstm(
@@ -115,7 +122,7 @@ class MLEnsemble:
         )
 
         # ------------------------------------------------
-        # ML Ensemble
+        # ML ENSEMBLE
         # ------------------------------------------------
 
         final_probability = (
@@ -133,7 +140,15 @@ class MLEnsemble:
         )
 
         # ------------------------------------------------
-        # Risk decision
+        # ML-ONLY RISK DECISION
+        #
+        # < 0.50  -> LOW / APPROVE
+        # < 0.80  -> MEDIUM / REVIEW
+        # >= 0.80 -> HIGH / BLOCK
+        #
+        # This is ONLY the ML decision.
+        # The transaction worker calculates
+        # the final system decision separately.
         # ------------------------------------------------
 
         if final_probability >= 0.80:
