@@ -22,6 +22,16 @@ _connection = None
 _channel = None
 
 
+def check_publisher_health() -> bool:
+    """Return whether the shared RabbitMQ publisher is currently open."""
+    return bool(
+        _connection is not None
+        and _connection.is_open
+        and _channel is not None
+        and _channel.is_open
+    )
+
+
 # ================================================================
 # CONNECT
 # ================================================================

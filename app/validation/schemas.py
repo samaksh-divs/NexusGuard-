@@ -25,6 +25,7 @@ class TransactionCreate(BaseModel):
     transaction_id: str = Field(..., min_length=1, description="Unique transaction identifier")
     timestamp: datetime
     symbol: str = Field(..., min_length=1, description="e.g. BTCUSDT")
+    amount: float | None = Field(default=None, gt=0)
     price: float = Field(..., gt=0)
     quantity: float = Field(..., gt=0)
     status: str = Field(default="received")

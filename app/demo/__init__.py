@@ -1,0 +1,1 @@
+"""Demo-mode transaction generation."""

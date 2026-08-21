@@ -28,6 +28,7 @@ from app.api.alert_dashboard import (
     router as alert_dashboard_router,
 )
 from app.api.dashboard import router as dashboard_router
+from app.api.demo import router as demo_router
 from app.config.settings import settings
 from app.database.mongodb import (
     check_mongo_health,
@@ -43,9 +44,15 @@ from app.database.repositories import (
 )
 from app.fraud.engine import risk_level_for_score
 from app.messaging.publisher import (
+    check_publisher_health,
     close_publisher,
     connect_publisher,
     publish_transaction,
+)
+from app.messaging.kafka_producer import (
+    check_kafka_health,
+    close_kafka_producer,
+    publish_kafka_transaction,
 )
 from app.validation.schemas import TransactionCreate
 
@@ -124,6 +131,11 @@ async def lifespan(app: FastAPI):
                 "Error while closing RabbitMQ publisher"
             )
 
+        try:
+            close_kafka_producer()
+        except Exception:
+            logger.exception("Error while closing Kafka producer")
+
         # --------------------------------------------------------
         # Close MongoDB
         # --------------------------------------------------------
@@ -193,6 +205,8 @@ app.include_router(
     alert_dashboard_router
 )
 
+app.include_router(demo_router)
+
 
 # ================================================================
 # ROOT
@@ -241,11 +255,21 @@ def health_check():
     """
 
     mongo_ok = check_mongo_health()
+    kafka_ok = check_kafka_health() if settings.kafka_enabled else False
+    rabbitmq_ok = check_publisher_health()
+    kafka_status = (
+        "connected"
+        if kafka_ok
+        else "unavailable"
+        if settings.kafka_enabled
+        else "not_configured"
+    )
+    nifi_status = "configured" if settings.nifi_enabled else "not_configured"
 
     return {
         "status": (
             "healthy"
-            if mongo_ok
+            if mongo_ok and rabbitmq_ok and (not settings.kafka_enabled or kafka_ok)
             else "degraded"
         ),
 
@@ -257,13 +281,17 @@ def health_check():
             else "unavailable"
         ),
 
-        "rabbitmq": "initialized",
+        "rabbitmq": "connected" if rabbitmq_ok else "unavailable",
+
+        "kafka": kafka_status,
+
+        "nifi": nifi_status,
 
         "dashboard": "enabled",
 
         "alerts": "enabled",
 
-        "phase": "9C",
+        "phase": "9/10",
     }
 
 
@@ -339,11 +367,13 @@ async def publish_test_transaction(
         mode="json"
     )
 
-    try:
+    payload["amount"] = payload.get("amount") or round(
+        float(payload["price"]) * float(payload["quantity"]),
+        8,
+    )
 
-        publish_transaction(
-            payload
-        )
+    try:
+        publish_transaction(payload)
 
         logger.info(
             "Transaction published successfully: %s",
@@ -376,6 +406,47 @@ async def publish_test_transaction(
             "Transaction accepted for "
             "asynchronous processing."
         ),
+        "transport": "rabbitmq",
+    }
+
+
+@app.post(
+    "/transactions/kafka/publish",
+    status_code=202,
+)
+async def publish_kafka_test_transaction(
+    transaction: TransactionCreate,
+):
+    """Publish directly to Kafka for the streaming-path comparison."""
+    if not settings.kafka_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Kafka publishing is not configured. Set KAFKA_ENABLED=true.",
+        )
+
+    payload = transaction.model_dump(mode="json")
+    payload["amount"] = payload.get("amount") or round(
+        float(payload["price"]) * float(payload["quantity"]),
+        8,
+    )
+
+    try:
+        publish_kafka_transaction(payload)
+    except Exception:
+        logger.exception(
+            "Failed to publish Kafka transaction %s",
+            transaction.transaction_id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to publish transaction to Kafka.",
+        )
+
+    return {
+        "status": "published",
+        "transport": "kafka",
+        "topic": settings.kafka_transaction_topic,
+        "transaction_id": transaction.transaction_id,
     }
 
 
@@ -1054,6 +1125,110 @@ def read_transaction_ml(
                 ),
             )
         ),
+    }
+
+
+# ================================================================
+# EXPLANATION ENDPOINT
+# ================================================================
+
+@app.get(
+    "/transactions/{transaction_id}/explanation"
+)
+def read_transaction_explanation(
+    transaction_id: str,
+):
+    """
+    Return a structured explanation of the risk decision
+    suitable for the UI.
+    """
+
+    doc = get_transaction(
+        transaction_id
+    )
+
+    if doc is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Transaction "
+                f"'{transaction_id}' "
+                f"not found."
+            ),
+        )
+
+    # Reconstruct Signals from string reasons
+    reasons = doc.get("fraud_reasons", doc.get("risk_reasons", []))
+    signals = []
+    critical_rule_triggered = False
+
+    for reason in reasons:
+        if "High transaction value" in reason and "Very high" not in reason and "Critical fraud rule" not in reason:
+            signals.append({
+                "type": "rule",
+                "name": "High Transaction Value",
+                "description": reason,
+                "severity": "HIGH",
+                "contribution": 25
+            })
+        elif "Very high transaction value" in reason and "Critical fraud rule" not in reason:
+            signals.append({
+                "type": "rule",
+                "name": "Very High Transaction Value",
+                "description": reason,
+                "severity": "CRITICAL",
+                "contribution": 25
+            })
+        elif "High transaction quantity" in reason:
+            signals.append({
+                "type": "rule",
+                "name": "High Transaction Quantity",
+                "description": reason,
+                "severity": "HIGH",
+                "contribution": 25
+            })
+        elif "Suspicious transaction symbol" in reason:
+            signals.append({
+                "type": "rule",
+                "name": "Suspicious Asset",
+                "description": reason,
+                "severity": "HIGH",
+                "contribution": 25
+            })
+        elif "Critical fraud rule triggered" in reason:
+            critical_rule_triggered = True
+        else:
+            signals.append({
+                "type": "rule",
+                "name": "Risk Signal",
+                "description": reason,
+                "severity": "MEDIUM",
+                "contribution": 0
+            })
+
+    # Recommendation and Final Decision
+    final_decision = doc.get("final_decision", doc.get("decision", "APPROVE"))
+    recommendation = "BLOCK TRANSACTION" if final_decision == "BLOCK" else ("REVIEW TRANSACTION" if final_decision == "REVIEW" else "APPROVE TRANSACTION")
+
+    return {
+        "transaction_id": doc["transaction_id"],
+        "risk_score": doc.get("final_risk_score", doc.get("risk_score", 0.0)),
+        "risk_level": doc.get("final_risk_level", doc.get("risk_level", "LOW")),
+        "decision": final_decision,
+        "critical_rule_triggered": critical_rule_triggered,
+        "signals": signals,
+        "behavior": {
+            "score": doc.get("behavioral_score", 0.0),
+            "signals": doc.get("behavioral_signals", [])
+        },
+        "ml": {
+            "random_forest": doc.get("ml_rf_score", doc.get("ml_rf_probability", 0.0)),
+            "xgboost": doc.get("ml_xgb_score", doc.get("ml_xgb_probability", 0.0)),
+            "lstm": doc.get("ml_lstm_score", doc.get("ml_lstm_probability", 0.0)),
+            "ensemble": doc.get("ml_final_probability", doc.get("ml_probability", 0.0))
+        },
+        "recommendation": recommendation
     }
 
 

@@ -43,6 +43,26 @@ class Settings(BaseSettings):
     # once. Kept configurable rather than hard-coded in consumer.py.
     rabbitmq_prefetch_count: int = 1
 
+    # --- Kafka ingestion bridge ---
+    # Disabled by default so existing RabbitMQ-only deployments keep
+    # their current startup and publishing behavior.
+    kafka_enabled: bool = False
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_transaction_topic: str = "nexusguard.transactions"
+    kafka_invalid_topic: str = "nexusguard.transactions.invalid"
+    kafka_processed_topic: str = "nexusguard.transactions.processed"
+    kafka_group_id: str = "nexusguard-transaction-consumer"
+    kafka_client_id: str = "nexusguard-api"
+    kafka_security_protocol: str = "PLAINTEXT"
+    kafka_sasl_mechanism: str | None = None
+    kafka_sasl_username: str | None = None
+    kafka_sasl_password: str | None = None
+    kafka_connection_timeout_seconds: float = 3.0
+
+    # --- Apache NiFi ---
+    nifi_enabled: bool = False
+    nifi_url: str = "https://localhost:8443/nifi"
+
     # --- Fraud Detection Engine (Phase 5) ---
     # Thresholds are configurable so tuning doesn't require code
     # changes. Defaults are sensible for local development/testing
@@ -95,7 +115,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # ignore vars in .env not yet used (e.g. future Mongo/RabbitMQ keys)
+        extra="ignore",
     )
 
     @property
