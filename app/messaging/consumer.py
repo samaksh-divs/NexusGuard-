@@ -51,14 +51,17 @@ except ImportError:
 
 def calculate_final_ml_risk(
     rule_score: float,
-    ml_score: float,
+    ml_score: float | None,
     critical_rule_triggered: bool = False,
 ) -> tuple[float, str, str]:
 
-    final_score = (
-        0.40 * float(rule_score)
-        + 0.60 * float(ml_score)
-    )
+    if ml_score is None:
+        final_score = float(rule_score)
+    else:
+        final_score = (
+            0.40 * float(rule_score)
+            + 0.60 * float(ml_score)
+        )
 
     final_score = float(
         round(
@@ -294,10 +297,10 @@ def _calculate_rule_score(
 def _run_ml_prediction(
     transaction: dict[str, Any],
 ) -> tuple[
-    float,
-    float,
-    float,
-    float,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
 ]:
 
     # ------------------------------------------------------------
@@ -306,17 +309,9 @@ def _run_ml_prediction(
 
     if predict_transaction_risk is None:
 
-        logger.warning(
-            "[ML] Prediction service unavailable. "
-            "Using ML score of 0."
-        )
+        logger.warning("[ML] Prediction service unavailable.")
 
-        return (
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )
+        return (None, None, None, None)
 
     # ------------------------------------------------------------
     # CALL ML SERVICE
@@ -332,41 +327,21 @@ def _run_ml_prediction(
 
     if isinstance(result, dict):
 
-        rf = float(
-            result.get(
-                "rf_probability",
-                0.0,
-            )
-        )
-
-        xgb = float(
-            result.get(
-                "xgb_probability",
-                0.0,
-            )
-        )
-
-        lstm = float(
-            result.get(
-                "lstm_probability",
-                0.0,
-            )
-        )
-
-        final = float(
-            result.get(
-                "final_probability",
-                0.0,
-            )
-        )
+        rf = result.get("rf_probability")
+        xgb = result.get("xgb_probability")
+        lstm = result.get("lstm_probability")
+        final = result.get("final_probability")
+        rf = float(rf) if rf is not None else None
+        xgb = float(xgb) if xgb is not None else None
+        lstm = float(lstm) if lstm is not None else None
+        final = float(final) if final is not None else None
 
         logger.info(
-            "[ML] Prediction received: "
-            "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
-            rf,
-            xgb,
-            lstm,
-            final,
+            "[ML] Prediction received: RF=%s XGB=%s LSTM=%s FINAL=%s",
+            f"{rf:.4f}" if rf is not None else "unavailable",
+            f"{xgb:.4f}" if xgb is not None else "unavailable",
+            f"{lstm:.4f}" if lstm is not None else "unavailable",
+            f"{final:.4f}" if final is not None else "unavailable",
         )
 
         return (
@@ -388,18 +363,17 @@ def _run_ml_prediction(
         and len(result) >= 4
     ):
 
-        rf = float(result[0])
-        xgb = float(result[1])
-        lstm = float(result[2])
-        final = float(result[3])
+        rf = float(result[0]) if result[0] is not None else None
+        xgb = float(result[1]) if result[1] is not None else None
+        lstm = float(result[2]) if result[2] is not None else None
+        final = float(result[3]) if result[3] is not None else None
 
         logger.info(
-            "[ML] Tuple/list prediction received: "
-            "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
-            rf,
-            xgb,
-            lstm,
-            final,
+            "[ML] Tuple/list prediction received: RF=%s XGB=%s LSTM=%s FINAL=%s",
+            f"{rf:.4f}" if rf is not None else "unavailable",
+            f"{xgb:.4f}" if xgb is not None else "unavailable",
+            f"{lstm:.4f}" if lstm is not None else "unavailable",
+            f"{final:.4f}" if final is not None else "unavailable",
         )
 
         return (
@@ -495,21 +469,18 @@ def handle_message(
     ml_latency_ms = round((time.time() - t_ml_start) * 1000.0, 2)
 
     logger.info(
-        "[WORKER] ML Ensemble: "
-        "RF=%.4f XGB=%.4f LSTM=%.4f FINAL=%.4f",
-        rf_score,
-        xgb_score,
-        lstm_score,
-        ml_probability,
+        "[WORKER] ML Ensemble: RF=%s XGB=%s LSTM=%s FINAL=%s",
+        f"{rf_score:.4f}" if rf_score is not None else "unavailable",
+        f"{xgb_score:.4f}" if xgb_score is not None else "unavailable",
+        f"{lstm_score:.4f}" if lstm_score is not None else "unavailable",
+        f"{ml_probability:.4f}" if ml_probability is not None else "unavailable",
     )
 
-    ml_score = float(
-        ml_probability * 100.0
-    )
+    ml_score = ml_probability * 100.0 if ml_probability is not None else None
 
     logger.info(
-        "[WORKER] ML Risk Score=%.2f",
-        ml_score,
+        "[WORKER] ML Risk Score=%s",
+        f"{ml_score:.2f}" if ml_score is not None else "unavailable",
     )
 
     # ============================================================
@@ -628,14 +599,18 @@ def handle_message(
             # ML decision fields
             "ml_risk_score": ml_score,
             "ml_risk_level": (
-                "HIGH"
+                None
+                if ml_score is None
+                else "HIGH"
                 if ml_score >= 80
                 else "MEDIUM"
                 if ml_score >= 50
                 else "LOW"
             ),
             "ml_decision": (
-                "BLOCK"
+                None
+                if ml_score is None
+                else "BLOCK"
                 if ml_score >= 80
                 else "REVIEW"
                 if ml_score >= 50

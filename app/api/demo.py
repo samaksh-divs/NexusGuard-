@@ -54,6 +54,11 @@ def list_datasets():
     return list(DATASET_CONFIGS.values())
 
 
+@router.get("/dataset-replay/analysis")
+def dataset_replay_analysis(dataset_id: str = "elliptic_bitcoin"):
+    return dataset_replay_engine.dataset_analysis(dataset_id)
+
+
 @router.post("/dataset-replay/start", status_code=202)
 def start_dataset_replay(payload: DatasetReplayRequest):
     success = dataset_replay_engine.start(

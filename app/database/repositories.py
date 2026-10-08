@@ -90,7 +90,7 @@ def insert_transaction(
 
     # Worker payloads may contain amount.
     # The transaction model normally contains price.
-    price = data.get(
+    raw_price = data.get(
         "price",
         data.get("amount", 0.0),
     )
@@ -100,20 +100,26 @@ def insert_transaction(
         1,
     )
 
-    try:
-        price = float(price or 0.0)
-    except (TypeError, ValueError):
-        price = 0.0
+    if raw_price is None:
+        price = None
+    else:
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            price = 0.0
 
     try:
         quantity = float(quantity or 0.0)
     except (TypeError, ValueError):
         quantity = 0.0
 
-    transaction_value = round(
-        price * quantity,
-        8,
-    )
+    transaction_value = data.get("transaction_value")
+    if transaction_value is None:
+        transaction_value = (
+            round(price * quantity, 8)
+            if price is not None
+            else None
+        )
 
     timestamp = data.get("timestamp")
 
@@ -136,6 +142,7 @@ def insert_transaction(
         "price": price,
         "quantity": quantity,
         "transaction_value": transaction_value,
+        "amount": data.get("amount"),
         "status": status,
         "account_id": account_id,
     }
@@ -151,9 +158,10 @@ def insert_transaction(
         "symbol",
         "price",
         "quantity",
+        "amount",
+        "transaction_value",
         "status",
         "account_id",
-        "amount",
     }
 
     for key, value in data.items():
@@ -264,6 +272,21 @@ def get_transaction(
     return doc
 
 
+def get_transactions_by_ids(
+    transaction_ids: list[str],
+) -> dict[str, dict]:
+    """Return existing transaction documents indexed by transaction ID."""
+
+    if not transaction_ids:
+        return {}
+
+    db = get_database()
+    documents = db["transactions"].find({
+        "transaction_id": {"$in": transaction_ids}
+    })
+    return {doc["transaction_id"]: doc for doc in documents}
+
+
 def get_transactions(
     limit: int = 50,
 ) -> list[dict]:
@@ -339,6 +362,28 @@ def serialize_transaction(
     optional_fields = (
 
         # --------------------------------------------------------
+        # Source transaction and dataset context
+        # --------------------------------------------------------
+
+        "source_transaction_id",
+        "source_dataset",
+        "sender",
+        "receiver",
+        "amount",
+        "fee",
+        "chain",
+        "original_label",
+        "ground_truth_label",
+        "ingestion_mode",
+        "network",
+        "bitcoin_amount",
+        "fee_sats",
+        "vin",
+        "vout",
+        "mempool_status",
+        "mempool_observed_at",
+
+        # --------------------------------------------------------
         # Phase 5 — Rule/Fraud Engine
         # --------------------------------------------------------
 
@@ -365,18 +410,23 @@ def serialize_transaction(
         "ml_lstm_score",
         "ml_final_probability",
         "ml_score",
+        "ml_latency_ms",
 
         # --------------------------------------------------------
         # Final Risk Decision
         # --------------------------------------------------------
 
         "final_risk_score",
+        "final_risk_level",
+        "final_decision",
         "risk_reasons",
 
         # --------------------------------------------------------
         # Processing Metadata
         # --------------------------------------------------------
 
+        "latency_ms",
+        "feature_latency_ms",
         "processed_at",
     )
 

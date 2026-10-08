@@ -13,6 +13,17 @@ import ActivityChart from '../charts/ActivityChart'
 
 function formatNumber(value) { return new Intl.NumberFormat().format(Number(value || 0)) }
 function formatMoney(value) { return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(Number(value || 0)) }
+function formatTransactionAmount(tx) {
+  if (tx.source_dataset === 'Mempool.space') {
+    return tx.bitcoin_amount == null
+      ? `${formatMoney(tx.amount)} USD`
+      : `${formatMoney(tx.bitcoin_amount)} BTC`
+  }
+  if (tx.ingestion_mode === 'DATASET_REPLAY') {
+    return tx.amount == null ? '—' : `${formatMoney(tx.amount)} ${tx.symbol}`
+  }
+  return formatMoney(tx.transaction_value)
+}
 function formatTime(value) { const d = new Date(value); return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString() }
 
 export default function Dashboard({ refreshKey }) {
@@ -81,7 +92,7 @@ export default function Dashboard({ refreshKey }) {
         <div className="panel">
           <div className="panel-heading"><div><h2>Recent transactions</h2><span>Latest 100 records available to the UI</span></div><Link to="/transactions" className="text-link">View all <ArrowUpRight size={16} /></Link></div>
           <div className="table-wrap compact"><table><thead><tr><th>Transaction</th><th>Risk</th><th>Decision</th><th>Value</th></tr></thead><tbody>
-            {transactions.slice(0, 8).map(tx => <tr key={tx.transaction_id}><td><Link className="table-link" to={`/transactions/${encodeURIComponent(tx.transaction_id)}`}>{tx.transaction_id}</Link><div className="muted">{tx.account_id} · {tx.symbol}</div></td><td><RiskBadge value={tx.risk_level} /></td><td><DecisionBadge value={tx.decision} /></td><td>{formatMoney(tx.transaction_value)}</td></tr>)}
+            {transactions.slice(0, 8).map(tx => <tr key={tx.transaction_id}><td><Link className="table-link" to={`/transactions/${encodeURIComponent(tx.transaction_id)}`}>{tx.transaction_id}</Link><div className="muted">{tx.account_id} · {tx.symbol}</div></td><td><RiskBadge value={tx.risk_level} /></td><td><DecisionBadge value={tx.decision} /></td><td>{formatTransactionAmount(tx)}</td></tr>)}
             {!transactions.length && <tr><td colSpan="4"><div className="empty-inline">No transactions available.</div></td></tr>}
           </tbody></table></div>
         </div>

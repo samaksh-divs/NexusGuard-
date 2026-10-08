@@ -31,9 +31,18 @@ export const api = {
   transactionBehavior: (id) => request(`/transactions/${encodeURIComponent(id)}/behavior`),
   transactionMl: (id) => request(`/transactions/${encodeURIComponent(id)}/ml`),
   health: () => request('/health'),
+  publishTransaction: (payload) => request('/transactions/publish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }),
+  demoStart: () => request('/demo/start', { method: 'POST' }),
+  demoStop: () => request('/demo/stop', { method: 'POST' }),
+  demoStatus: () => request('/demo/status'),
   
   // Dataset Replay API methods
   listDatasets: () => request('/demo/dataset-replay/datasets'),
+  datasetAnalysis: (datasetId) => request(`/demo/dataset-replay/analysis?dataset_id=${encodeURIComponent(datasetId || 'elliptic_bitcoin')}`),
   startDatasetReplay: (payload) => request('/demo/dataset-replay/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -45,4 +54,3 @@ export const api = {
 }
 
 export { API_BASE_URL }
-

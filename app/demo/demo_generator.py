@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.demo.crypto_dataset import load_crypto_dataset
-from app.demo.demo_profiles import DEMO_PROFILES
 from app.database.repositories import get_transaction
 from app.messaging.publisher import publish_transaction
 
@@ -21,6 +20,7 @@ class DemoGenerator:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._transactions: list[dict[str, Any]] = []
+        self._transactions_generated = 0
 
     def start(self) -> bool:
         with self._lock:
@@ -28,6 +28,7 @@ class DemoGenerator:
                 return False
             self._stop_event.clear()
             self._transactions = []
+            self._transactions_generated = 0
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
             return True
@@ -65,7 +66,7 @@ class DemoGenerator:
             "running": self.running,
             "mode": "crypto_demo",
             "current_user": transactions[-1]["account_id"] if transactions else None,
-            "transactions_generated": len(transactions),
+            "transactions_generated": self._transactions_generated,
             "processed": len(processed),
             "approved": sum(item.get("decision") == "APPROVE" for item in processed),
             "blocked": sum(item.get("decision") == "BLOCK" for item in processed),
@@ -78,27 +79,31 @@ class DemoGenerator:
 
     def _run(self) -> None:
         records = load_crypto_dataset(12)
-        for record in records:
-            if self._stop_event.is_set():
-                break
-            transaction = {
-                "transaction_id": f"DEMO-{datetime.now(timezone.utc):%Y%m%d%H%M%S%f}-{uuid.uuid4().hex[:6]}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "symbol": record["symbol"],
-                "amount": record["amount"],
-                "price": record["price"],
-                "quantity": record["quantity"],
-                "status": "received",
-                "account_id": record["account_id"],
-            }
-            try:
-                publish_transaction(transaction)
-                with self._lock:
-                    self._transactions.append(transaction)
-            except Exception:
-                logger.exception("Demo transaction publish failed")
-                break
-            self._stop_event.wait(self.delay_seconds)
+        while not self._stop_event.is_set():
+            for record in records:
+                if self._stop_event.is_set():
+                    break
+                transaction = {
+                    "transaction_id": f"DEMO-{datetime.now(timezone.utc):%Y%m%d%H%M%S%f}-{uuid.uuid4().hex[:6]}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "symbol": record["symbol"],
+                    "amount": record["amount"],
+                    "price": record["price"],
+                    "quantity": record["quantity"],
+                    "status": "received",
+                    "account_id": record["account_id"],
+                }
+                try:
+                    publish_transaction(transaction)
+                    with self._lock:
+                        self._transactions.append(transaction)
+                        self._transactions_generated += 1
+                        if len(self._transactions) > 100:
+                            del self._transactions[:-100]
+                except Exception:
+                    logger.exception("Demo transaction publish failed")
+                    return
+                self._stop_event.wait(self.delay_seconds)
 
 
 demo_generator = DemoGenerator()

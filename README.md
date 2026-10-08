@@ -31,14 +31,13 @@ python --version
 ## Installation
 
 ```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard-phase6
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
 Set a real local `NIFI_PASSWORD` in `.env` before starting Compose. Do not commit `.env`.
 
-The frontend is a separate project at `C:\Users\achar\Downloads\nexusguard_phase8_frontend\nexusguard_phase8_frontend`.
+Run the dashboard commands from the repository's `dashboard` directory.
 
 ## Configuration
 
@@ -51,7 +50,6 @@ Start the existing MongoDB and RabbitMQ installations normally. Their applicatio
 Start Kafka and NiFi:
 
 ```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard-phase6
 docker compose up -d
 docker compose ps
 docker compose logs -f kafka
@@ -72,6 +70,7 @@ docker compose exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --cr
 Start the backend processes in separate PowerShell windows:
 
 ```powershell
+# From the repository root; the dashboard defaults to this API port.
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 python -m app.workers.transaction_worker
 python -m app.messaging.kafka_consumer
@@ -80,15 +79,14 @@ python -m app.messaging.kafka_consumer
 Start the frontend:
 
 ```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard_phase8_frontend\nexusguard_phase8_frontend
+Set-Location .\dashboard
 npm install
-npm run dev
+npm run dev -- --host 127.0.0.1
 ```
 
 Stop Kafka and NiFi:
 
 ```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard-phase6
 docker compose down
 ```
 

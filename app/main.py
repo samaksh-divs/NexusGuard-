@@ -54,6 +54,7 @@ from app.messaging.kafka_producer import (
     close_kafka_producer,
     publish_kafka_transaction,
 )
+from app.ml.model_status import get_model_availability
 from app.validation.schemas import TransactionCreate
 
 
@@ -181,6 +182,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -373,6 +378,13 @@ async def publish_test_transaction(
     )
 
     try:
+        if get_transaction(transaction.transaction_id):
+            return {
+                "status": "already_processed",
+                "transaction_id": transaction.transaction_id,
+                "transport": "rabbitmq",
+            }
+
         publish_transaction(payload)
 
         logger.info(
@@ -762,6 +774,8 @@ def read_transaction_risk(
         "ml_probability": (
             ml_probability
         ),
+
+        "model_availability": get_model_availability(),
 
         "ml_risk_score": (
             ml_risk_score

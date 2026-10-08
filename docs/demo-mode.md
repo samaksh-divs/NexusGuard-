@@ -1,66 +1,28 @@
-# Demo Mode
+# Batch Evaluation and Live Streaming
 
-Demo Mode is a presentation-friendly replay of prepared, synthetic crypto transaction patterns. It is explicitly labeled as `DEMO / SIMULATED CRYPTO TRANSACTIONS`; it does not connect to an exchange, wallet, or real financial data source.
+The dashboard has two monitor modes: **Batch** and **Streaming**. They use different data sources and must not be conflated.
 
-## Dataset and transformation
+## Batch: historical labeled CSVs
 
-The local artifact is `data/crypto_demo_transactions.csv`. The repository also contains the public Elliptic dataset under `data/elliptic/`, but those feature/class tables do not match NexusGuard's price and quantity contract, so Demo Mode uses the small local pattern set instead of pretending to be live exchange data. `app/demo/crypto_dataset.py` expands those reviewed patterns deterministically to 120 records with timestamp, account, symbol, price, quantity, amount, frequency, wallet age, history count, and label fields.
+Batch replay publishes selected historical CSV rows through the existing FastAPI and RabbitMQ transaction worker. The dashboard compares actual persisted NexusGuard decisions with CSV ground-truth labels only after processing. REVIEW and BLOCK count as positive fraud predictions. Accuracy, precision, recall, and F1 are pipeline-level evaluation metrics.
 
-The generator maps only the transaction fields required by the existing Kafka consumer: transaction ID, timestamp, symbol, amount, price, quantity, status, and account ID. A unique ID is created for every replay.
+Per-model Random Forest, XGBoost, LSTM, and ensemble metrics require both available model artifacts and actual labeled predictions. Missing model artifacts or predictions are reported as unavailable; they are not replaced by fabricated probabilities.
 
-## Profiles
+## Streaming: Mempool.space Bitcoin mainnet
 
-User A (`DEMO-USER-A`) is a normal crypto trader. Its records use BTCUSDT, ETHUSDT, BNBUSDT, and SOLUSDT with normal quantities and values.
+Selecting **Streaming** opens `wss://mempool.space/api/v1/ws` and subscribes with `{"track-mempool": true}`. For each actual transaction ID received, the dashboard fetches transaction details from `https://mempool.space/api/tx/{txid}` and the current BTC/USD price from `https://mempool.space/api/v1/prices`. It submits the source transaction and its inputs, outputs, fee, observed time, and source metadata to NexusGuard's `POST /transactions/publish` endpoint.
 
-User B (`DEMO-USER-B`) is a suspicious crypto trader. Its records include unusually high quantities, very large values, rapid-frequency metadata, and a `SCAM` symbol that the existing fraud rules recognize. There is no account-specific BLOCK branch. The final result is calculated by the existing fraud worker and its critical override.
+The transaction continues through the configured RabbitMQ worker and MongoDB persistence path. Only completed backend results appear in the live table. Transaction details show the source-provided Bitcoin data and the reasons returned by NexusGuard. Live transactions do not receive CSV labels or historical evaluation metrics.
 
-## Processing path
+The dashboard reports connection, reconnect, API, and processing errors rather than presenting an unprocessed transaction as approved. RabbitMQ and the transaction worker must be running for live transactions to be analyzed and stored.
 
-```text
-Demo generator -> Kafka -> Kafka consumer -> RabbitMQ -> transaction worker
-  -> fraud rules + behavioral analysis -> RF/XGBoost/LSTM -> ML ensemble
-  -> final decision -> MongoDB -> alerts -> dashboard
-```
+## API and local development
 
-The generator never writes MongoDB directly, calls the worker directly, or bypasses Kafka. The consumer remains a thin validation and RabbitMQ forwarding layer.
+- `POST /demo/dataset-replay/start` starts a historical CSV replay.
+- `GET /demo/dataset-replay/status` returns processed replay results and evaluation metrics.
+- `POST /demo/dataset-replay/stop` stops replay.
+- `POST /demo/dataset-replay/reset` resets replay status.
+- `POST /transactions/publish` publishes a transaction into the asynchronous processing pipeline.
+- `GET /health` reports API dependency status.
 
-## API
-
-- `POST /demo/start` starts one cancellable 12-transaction replay.
-- `POST /demo/stop` requests a stop between transactions.
-- `GET /demo/status` returns running state and counters derived from persisted transaction results.
-- `GET /demo/users` returns the two demo profiles.
-- `GET /demo/transactions` returns generated payloads, which the UI joins with the latest backend results.
-
-## Dashboard
-
-The React dashboard's **Live Demo** page polls the demo endpoints and recent alerts every 1.5 to 3 seconds. Start and stop controls invoke the API. The stream displays actual risk level, decision, score-related fields, and alert presence returned by the backend; counters are not hard-coded.
-
-## Run it
-
-Start Kafka, the existing RabbitMQ worker, the Kafka consumer, and FastAPI first:
-
-```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard-phase6
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-python -m app.messaging.kafka_consumer
-python -m app.workers.transaction_worker
-```
-
-Then open the frontend and visit `/demo`:
-
-```powershell
-Set-Location C:\Users\achar\Downloads\nexusguard_phase8_frontend\nexusguard_phase8_frontend
-npm run dev -- --host 127.0.0.1 --port 5173
-```
-
-Or control it from PowerShell:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/demo/start -Method POST
-Invoke-RestMethod http://127.0.0.1:8000/demo/status
-Invoke-RestMethod http://127.0.0.1:8000/demo/transactions
-Invoke-RestMethod http://127.0.0.1:8000/demo/stop -Method POST
-```
-
-The expected presentation outcome is normal User A records becoming `LOW/APPROVE`, while User B records containing the high-value, high-quantity, and `SCAM` signals become `HIGH/BLOCK` and create alerts through the existing worker.
+Run FastAPI and the transaction worker using the project's configured environment, then start the dashboard from `dashboard/`. The development dashboard uses port 5173 by default; if that port is occupied, Vite selects the next available port.

@@ -54,38 +54,29 @@ class MLEnsemble:
         self,
         features,
     ):
-        if not self.random_forest or not self.xgboost:
-            return 0.0, 0.0
+        rf_probability = None
+        if self.random_forest is not None:
+            feature_names = self.random_forest.feature_names_in_
+            features_df = pd.DataFrame(features, columns=feature_names)
+            rf_probability = float(self.random_forest.predict_proba(features_df)[0][1])
 
-        # Random Forest and XGBoost were trained
-        # with feature_1 ... feature_165.
-
-        feature_names = self.random_forest.feature_names_in_
-
-        features_df = pd.DataFrame(
-            features,
-            columns=feature_names,
-        )
-
-        rf_probability = self.random_forest.predict_proba(
-            features_df
-        )[0][1]
-
-        xgb_probability = self.xgboost.predict_proba(
-            features_df
-        )[0][1]
+        xgb_probability = None
+        if self.xgboost is not None:
+            feature_names = self.xgboost.feature_names_in_
+            features_df = pd.DataFrame(features, columns=feature_names)
+            xgb_probability = float(self.xgboost.predict_proba(features_df)[0][1])
 
         return (
-            float(rf_probability),
-            float(xgb_probability),
+            rf_probability,
+            xgb_probability,
         )
 
     def predict_lstm(
         self,
         sequence,
     ):
-        if not self.scaler or not self.lstm:
-            return 0.0
+        if self.scaler is None or self.lstm is None:
+            return None
 
         sequence = np.asarray(
             sequence,
@@ -133,19 +124,28 @@ class MLEnsemble:
         # ML ENSEMBLE
         # ------------------------------------------------
 
-        final_probability = (
-            0.35 * rf_probability
-            + 0.35 * xgb_probability
-            + 0.30 * lstm_probability
-        )
+        available_predictions = [
+            (rf_probability, 0.35),
+            (xgb_probability, 0.35),
+            (lstm_probability, 0.30),
+        ]
+        available_predictions = [
+            (probability, weight)
+            for probability, weight in available_predictions
+            if probability is not None
+        ]
+        if available_predictions:
+            total_weight = sum(weight for _, weight in available_predictions)
+            final_probability = sum(
+                probability * weight
+                for probability, weight in available_predictions
+            ) / total_weight
+            final_probability = float(np.clip(final_probability, 0.0, 1.0))
+        else:
+            final_probability = None
 
-        final_probability = float(
-            np.clip(
-                final_probability,
-                0.0,
-                1.0,
-            )
-        )
+        def rounded_probability(probability):
+            return round(probability, 4) if probability is not None else None
 
         # ------------------------------------------------
         # ML-ONLY RISK DECISION
@@ -159,7 +159,10 @@ class MLEnsemble:
         # the final system decision separately.
         # ------------------------------------------------
 
-        if final_probability >= 0.80:
+        if final_probability is None:
+            risk_level = None
+            decision = None
+        elif final_probability >= 0.80:
 
             risk_level = "HIGH"
             decision = "BLOCK"
@@ -175,29 +178,15 @@ class MLEnsemble:
             decision = "APPROVE"
 
         return {
-            "rf_probability": round(
-                rf_probability,
-                4,
-            ),
+            "rf_probability": rounded_probability(rf_probability),
+            "xgb_probability": rounded_probability(xgb_probability),
+            "lstm_probability": rounded_probability(lstm_probability),
+            "final_probability": rounded_probability(final_probability),
 
-            "xgb_probability": round(
-                xgb_probability,
-                4,
-            ),
-
-            "lstm_probability": round(
-                lstm_probability,
-                4,
-            ),
-
-            "final_probability": round(
-                final_probability,
-                4,
-            ),
-
-            "risk_score": round(
-                final_probability * 100,
-                2,
+            "risk_score": (
+                round(final_probability * 100, 2)
+                if final_probability is not None
+                else None
             ),
 
             "risk_level": risk_level,
